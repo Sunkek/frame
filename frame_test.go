@@ -233,6 +233,49 @@ func TestSupervisor_DependencyOrder(t *testing.T) {
 	}
 }
 
+func TestSupervisor_InsertionOrderRespected(t *testing.T) {
+	// Without any declared dependencies, components must start in Add() order
+	// and stop in reverse Add() order. Run this multiple times to catch any
+	// map-iteration non-determinism.
+	for range 20 {
+		sup := frame.NewSupervisor(
+			frame.WithStartProbeWindow(5 * time.Millisecond),
+		)
+
+		first := newMock("first")
+		second := newMock("second")
+		third := newMock("third")
+
+		sup.Add(first)
+		sup.Add(second)
+		sup.Add(third)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- sup.Run(ctx) }()
+
+		// Sequential start: first must be started before second, second before third.
+		waitStarted(t, first, 2*time.Second)
+		waitStarted(t, second, 2*time.Second)
+		waitStarted(t, third, 2*time.Second)
+
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("supervisor did not stop in time")
+		}
+
+		// Verify all three were stopped.
+		if first.stopCalled.Load() == 0 || second.stopCalled.Load() == 0 || third.stopCalled.Load() == 0 {
+			t.Fatal("not all components were stopped")
+		}
+	}
+}
+
 func TestSupervisor_CircularDependency(t *testing.T) {
 	sup := frame.NewSupervisor()
 	a := newMock("a")

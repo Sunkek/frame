@@ -84,8 +84,9 @@ func WithStartProbeWindow(d time.Duration) SupervisorOption {
 // window before its dependencies disappear.
 type Supervisor struct {
 	// registration-time state (written before Run, read-only after)
-	components map[string]*managedComponent
-	order      []*managedComponent // topological order, set in Run
+	components     map[string]*managedComponent
+	insertionOrder []string            // preserves Add() call order for stable topo sort
+	order          []*managedComponent // topological order, set in Run
 
 	// configuration (immutable after construction)
 	healthInterval     time.Duration
@@ -162,6 +163,7 @@ func (s *Supervisor) Add(c Component, opts ...ComponentOption) {
 		restartPolicy: cfg.restartPolicy,
 		deps:          cfg.deps,
 	}
+	s.insertionOrder = append(s.insertionOrder, name)
 }
 
 // ComponentHealth returns the last known health error for a named component,
@@ -214,7 +216,6 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	// calling stopAll.
 	var wg sync.WaitGroup
 
-outer:
 	for _, mc := range ordered {
 		// launch launches Start in a goroutine and returns a channel that
 		// delivers exactly one value: nil when the component is ready (Start
@@ -242,7 +243,7 @@ outer:
 			// while we were waiting for this one to become ready.
 			s.stopAll(started)
 			<-startErrCh
-			break outer
+			break
 		}
 
 		started = append(started, mc)
@@ -600,7 +601,10 @@ func (s *Supervisor) topoSort() ([]*managedComponent, error) {
 		return nil
 	}
 
-	for name := range s.components {
+	// Drive the outer loop from insertionOrder so that components with no
+	// declared dependency between them are started in Add() call order.
+	// This makes registration order the stable, predictable tiebreaker.
+	for _, name := range s.insertionOrder {
 		if err := visit(name); err != nil {
 			return nil, err
 		}
