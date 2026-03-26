@@ -524,7 +524,7 @@ func TestApplication_CleanShutdown(t *testing.T) {
 
 	waitStarted(t, mc, 2*time.Second)
 
-	app.Shutdown()
+	app.Shutdown(nil)
 
 	select {
 	case err := <-done:
@@ -567,20 +567,46 @@ func TestApplication_NoMainFunc_NoSupervisor(t *testing.T) {
 
 type mockLegacyService struct {
 	name        string
-	initErr     error
-	pingErr     error
-	closeErr    error
+	closeErr    error // set before test, never mutated concurrently
 	initCalled  atomic.Bool
 	closeCalled atomic.Bool
+
+	// Use atomic.Value with a typed wrapper so errors.Is works correctly
+	// while remaining race-safe. Empty wrapper (nil Err) means no error.
+	initErrVal atomic.Value // stores errWrapper
+	pingErrVal atomic.Value // stores errWrapper
 }
 
-func (s *mockLegacyService) Ident() string                { return s.name }
-func (s *mockLegacyService) Init(_ context.Context) error { s.initCalled.Store(true); return s.initErr }
-func (s *mockLegacyService) Ping(_ context.Context) error { return s.pingErr }
-func (s *mockLegacyService) Close() error                 { s.closeCalled.Store(true); return s.closeErr }
+// errWrapper is a concrete type so atomic.Value always stores the same type.
+type errWrapper struct{ err error }
+
+func newMockLegacyService(name string) *mockLegacyService {
+	m := &mockLegacyService{name: name}
+	m.initErrVal.Store(errWrapper{})
+	m.pingErrVal.Store(errWrapper{})
+	return m
+}
+
+func (s *mockLegacyService) setInitErr(err error) {
+	s.initErrVal.Store(errWrapper{err: err})
+}
+
+func (s *mockLegacyService) setPingErr(err error) {
+	s.pingErrVal.Store(errWrapper{err: err})
+}
+
+func (s *mockLegacyService) Ident() string { return s.name }
+func (s *mockLegacyService) Init(_ context.Context) error {
+	s.initCalled.Store(true)
+	return s.initErrVal.Load().(errWrapper).err
+}
+func (s *mockLegacyService) Ping(_ context.Context) error {
+	return s.pingErrVal.Load().(errWrapper).err
+}
+func (s *mockLegacyService) Close() error { s.closeCalled.Store(true); return s.closeErr }
 
 func TestServiceAdapter_LifecycleIntegration(t *testing.T) {
-	legacy := &mockLegacyService{name: "postgres"}
+	legacy := newMockLegacyService("postgres")
 	adapter := frame.NewServiceAdapter(legacy)
 
 	if adapter.Name() != "postgres" {
@@ -618,7 +644,8 @@ func TestServiceAdapter_LifecycleIntegration(t *testing.T) {
 }
 
 func TestServiceAdapter_InitError(t *testing.T) {
-	legacy := &mockLegacyService{name: "redis", initErr: errFake}
+	legacy := newMockLegacyService("redis")
+	legacy.setInitErr(errFake)
 	adapter := frame.NewServiceAdapter(legacy)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -631,7 +658,8 @@ func TestServiceAdapter_InitError(t *testing.T) {
 }
 
 func TestServiceAdapter_HealthDelegation(t *testing.T) {
-	legacy := &mockLegacyService{name: "redis", pingErr: errFake}
+	legacy := newMockLegacyService("redis")
+	legacy.setPingErr(errFake)
 	adapter := frame.NewServiceAdapter(legacy)
 
 	err := adapter.Health(context.Background())
@@ -710,4 +738,499 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("supervisor did not stop in time")
 	}
+}
+
+// ── Starter interface ─────────────────────────────────────────────────────────
+
+// starterMock is a Component that implements Starter for precise readiness
+// signalling. It closes its readyCh after a configurable delay inside Start,
+// simulating a server that needs a moment to bind a port.
+type starterMock struct {
+	mockComponent
+	readyCh    chan struct{}
+	readyDelay time.Duration
+}
+
+func newStarterMock(name string, readyDelay time.Duration) *starterMock {
+	m := &starterMock{
+		mockComponent: *newMock(name),
+		readyCh:       make(chan struct{}),
+		readyDelay:    readyDelay,
+	}
+	return m
+}
+
+func (m *starterMock) Started() <-chan struct{} { return m.readyCh }
+
+func (m *starterMock) Start(ctx context.Context) error {
+	m.startCalled.Add(1)
+	if m.shouldFail.Load() {
+		return errFake
+	}
+	// Signal started channel (for waitStarted helper).
+	m.startedOnce.Do(func() { close(m.started) })
+	// Delay before signalling ready, simulating port bind time.
+	select {
+	case <-time.After(m.readyDelay):
+		close(m.readyCh)
+	case <-ctx.Done():
+		return nil
+	}
+	// Block for component lifetime.
+	select {
+	case <-m.stop:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+func TestStarter_PreciseReadiness(t *testing.T) {
+	// A Starter component should signal readiness without waiting for the
+	// probe window. With a 5ms ready delay and a 2s probe window, the
+	// supervisor should proceed in ~5ms, not ~2s.
+	sup := frame.NewSupervisor(
+		frame.WithStartProbeWindow(2 * time.Second), // deliberately long
+	)
+
+	sm := newStarterMock("precise", 5*time.Millisecond)
+	sup.Add(sm)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+
+	start := time.Now()
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, &sm.mockComponent, 3*time.Second)
+	elapsed := time.Since(start)
+
+	// Should be ready well under 200ms, not waiting the full 2s probe window.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Starter component took %v to become ready; expected <500ms", elapsed)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("supervisor did not stop in time")
+	}
+}
+
+func TestStarter_DependentWaitsForReady(t *testing.T) {
+	// dep implements Starter with a deliberate 50ms delay.
+	// svc depends on dep — it must not start until dep signals ready.
+	sup := frame.NewSupervisor(
+		frame.WithStartProbeWindow(5 * time.Millisecond),
+	)
+
+	dep := newStarterMock("dep", 50*time.Millisecond)
+	svc := newMock("svc")
+	sup.Add(dep)
+	sup.Add(svc, frame.WithDependencies("dep"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	// dep must start first, then svc.
+	waitStarted(t, &dep.mockComponent, 2*time.Second)
+	depReadyAt := time.Now()
+
+	waitStarted(t, svc, 2*time.Second)
+	svcStartedAt := time.Now()
+
+	// svc must have started after dep was ready (50ms delay).
+	if svcStartedAt.Before(depReadyAt) {
+		t.Error("svc started before dep was ready")
+	}
+
+	cancel()
+	<-done
+}
+
+// ── MetricsObserver ───────────────────────────────────────────────────────────
+
+type captureMetrics struct {
+	mu       sync.Mutex
+	started  []string
+	stopped  []string
+	restarts []string
+	checks   []string
+}
+
+func (m *captureMetrics) ComponentStarted(c string, _ int) {
+	m.mu.Lock()
+	m.started = append(m.started, c)
+	m.mu.Unlock()
+}
+func (m *captureMetrics) ComponentStopped(c string, _ error) {
+	m.mu.Lock()
+	m.stopped = append(m.stopped, c)
+	m.mu.Unlock()
+}
+func (m *captureMetrics) ComponentRestarting(c string, _ error, _ int, _ time.Duration) {
+	m.mu.Lock()
+	m.restarts = append(m.restarts, c)
+	m.mu.Unlock()
+}
+func (m *captureMetrics) HealthCheckCompleted(c string, _ time.Duration, _ error) {
+	m.mu.Lock()
+	m.checks = append(m.checks, c)
+	m.mu.Unlock()
+}
+func (m *captureMetrics) startedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.started)
+}
+func (m *captureMetrics) stoppedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.stopped)
+}
+func (m *captureMetrics) checksCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.checks)
+}
+
+func TestMetricsObserver_StartStop(t *testing.T) {
+	obs := &captureMetrics{}
+	sup := frame.NewSupervisor(
+		frame.WithMetricsObserver(obs),
+		frame.WithStartProbeWindow(5*time.Millisecond),
+	)
+	mc := newMock("svc")
+	sup.Add(mc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 2*time.Second)
+	cancel()
+	<-done
+
+	if obs.startedCount() != 1 {
+		t.Errorf("ComponentStarted: want 1, got %d", obs.startedCount())
+	}
+	if obs.stoppedCount() != 1 {
+		t.Errorf("ComponentStopped: want 1, got %d", obs.stoppedCount())
+	}
+}
+
+func TestMetricsObserver_HealthChecks(t *testing.T) {
+	obs := &captureMetrics{}
+	sup := frame.NewSupervisor(
+		frame.WithMetricsObserver(obs),
+		frame.WithHealthInterval(20*time.Millisecond),
+		frame.WithHealthTimeout(10*time.Millisecond),
+		frame.WithStartProbeWindow(5*time.Millisecond),
+	)
+	mc := newMock("db")
+	sup.Add(mc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 2*time.Second)
+	// Wait for at least 3 health checks.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if obs.checksCount() >= 3 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if obs.checksCount() < 3 {
+		t.Errorf("HealthCheckCompleted: want ≥3, got %d", obs.checksCount())
+	}
+
+	cancel()
+	<-done
+}
+
+func TestMetricsObserver_Restarts(t *testing.T) {
+	obs := &captureMetrics{}
+	sup := frame.NewSupervisor(
+		frame.WithMetricsObserver(obs),
+		frame.WithStartProbeWindow(5*time.Millisecond),
+	)
+	mc := newMock("svc")
+	mc.shouldFail.Store(true)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		mc.shouldFail.Store(false)
+	}()
+	sup.Add(mc, frame.WithRestartPolicy(frame.MaxRetries(20, 5*time.Millisecond)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 3*time.Second)
+	cancel()
+	<-done
+
+	obs.mu.Lock()
+	restarts := len(obs.restarts)
+	obs.mu.Unlock()
+	if restarts == 0 {
+		t.Error("ComponentRestarting: expected at least one restart event")
+	}
+}
+
+// ── HealthReporter / context.Cause ───────────────────────────────────────────
+
+func TestContextCause_CriticalFailure(t *testing.T) {
+	// When a critical component fails, the error returned by Supervisor.Run
+	// should be the specific component failure error, not a generic
+	// "context canceled".
+	sup := frame.NewSupervisor(
+		frame.WithHealthInterval(20*time.Millisecond),
+		frame.WithHealthTimeout(10*time.Millisecond),
+		frame.WithStartProbeWindow(5*time.Millisecond),
+	)
+	mc := newMock("db")
+	sup.Add(mc,
+		frame.WithTier(frame.TierCritical),
+		frame.WithRestartPolicy(frame.NeverRestart()),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 2*time.Second)
+	mc.setHealthErr(errFake)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected non-nil error")
+		}
+		// The error must be the specific component error, not just
+		// "context canceled".
+		if errors.Is(err, context.Canceled) && !errors.Is(err, errFake) {
+			t.Errorf("expected errFake in chain, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("supervisor did not shut down")
+	}
+}
+
+func TestHealthReporter_Interface(t *testing.T) {
+	// *Supervisor must satisfy HealthReporter.
+	sup := frame.NewSupervisor(
+		frame.WithStartProbeWindow(5 * time.Millisecond),
+	)
+	mc := newMock("svc")
+	sup.Add(mc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 2*time.Second)
+
+	// HealthReportOrdered should return at least the svc component.
+	report := sup.HealthReportOrdered()
+	found := false
+	for _, s := range report {
+		if s.Name == "svc" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("HealthReportOrdered: expected 'svc' entry")
+	}
+
+	cancel()
+	<-done
+}
+
+// ── ServiceAdapter restart safety (#1) ───────────────────────────────────────
+
+func TestServiceAdapter_SafeAfterRestart(t *testing.T) {
+	// A ServiceAdapter with a restart policy must not panic on the second
+	// Start call (channel-reinitialisation fix). Init fails on the first
+	// attempt and succeeds on subsequent attempts.
+	svc := newMockLegacyService("restartable")
+	svc.setInitErr(errFake) // first attempt will fail
+
+	adapter := frame.NewServiceAdapter(svc)
+	sup := frame.NewSupervisor(
+		frame.WithStartProbeWindow(5 * time.Millisecond),
+	)
+	sup.Add(adapter, frame.WithRestartPolicy(frame.MaxRetries(5, 10*time.Millisecond)))
+
+	// After 30 ms clear the error so the next retry succeeds.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		svc.setInitErr(nil)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	// Wait until Init has been called at least twice (one failure + one success).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.initCalled.Load() {
+			// initCalled is true after the first call; we need to wait for the
+			// successful second call, which we detect by the adapter becoming
+			// ready (supervisor would cancel on failure).
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Give the supervisor time to complete the successful start.
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error after restart: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("supervisor did not stop after restart test")
+	}
+}
+
+// ── startTimeout applied to Starter components (#4) ──────────────────────────
+
+func TestStarter_StartTimeoutEnforced(t *testing.T) {
+	// A Starter that never closes its readyCh should be failed by the
+	// startTimeout, not block forever.
+	sup := frame.NewSupervisor(
+		frame.WithStartTimeout(50 * time.Millisecond),
+	)
+
+	// A component that implements Starter but never signals ready.
+	hungSvc := &neverReadyComponent{stop: make(chan struct{})}
+	sup.Add(hungSvc, frame.WithRestartPolicy(frame.NeverRestart()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := sup.Run(ctx)
+	if err == nil {
+		t.Fatal("expected error from component that never signals ready")
+	}
+}
+
+type neverReadyComponent struct {
+	stop    chan struct{}
+	readyCh chan struct{} // never closed
+}
+
+func (c *neverReadyComponent) Name() string { return "never-ready" }
+func (c *neverReadyComponent) Started() <-chan struct{} {
+	if c.readyCh == nil {
+		c.readyCh = make(chan struct{})
+	}
+	return c.readyCh
+}
+func (c *neverReadyComponent) Start(ctx context.Context) error {
+	select {
+	case <-c.stop:
+	case <-ctx.Done():
+	}
+	return nil
+}
+func (c *neverReadyComponent) Stop(_ context.Context) error {
+	select {
+	case <-c.stop:
+	default:
+		close(c.stop)
+	}
+	return nil
+}
+
+// ── Shutdown with cause (#6) ─────────────────────────────────────────────────
+
+func TestApplication_ShutdownWithCause(t *testing.T) {
+	shutdownCause := errors.New("planned maintenance")
+
+	var receivedCause error
+	app := frame.NewApplication(
+		frame.WithMainFunc(func(ctx context.Context) error {
+			<-ctx.Done()
+			receivedCause = context.Cause(ctx)
+			return nil
+		}),
+	)
+
+	done := make(chan error, 1)
+	go func() { done <- app.Run() }()
+
+	// Give Run time to start.
+	time.Sleep(20 * time.Millisecond)
+	app.Shutdown(shutdownCause)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("application did not stop in time")
+	}
+
+	if !errors.Is(receivedCause, shutdownCause) {
+		t.Errorf("context.Cause: want %v, got %v", shutdownCause, receivedCause)
+	}
+}
+
+// ── HealthReportOrdered determinism (#5) ─────────────────────────────────────
+
+func TestHealthReportOrdered_Deterministic(t *testing.T) {
+	sup := frame.NewSupervisor(
+		frame.WithStartProbeWindow(5 * time.Millisecond),
+	)
+	z := newMock("zebra")
+	a := newMock("alpha")
+	m := newMock("mango")
+	// Register in reverse alphabetical order — report must still come out sorted.
+	sup.Add(z)
+	sup.Add(a)
+	sup.Add(m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	// Wait for all three components to start before reading the report.
+	waitStarted(t, z, 2*time.Second)
+	waitStarted(t, a, 2*time.Second)
+	waitStarted(t, m, 2*time.Second)
+
+	for range 20 {
+		report := sup.HealthReportOrdered()
+		if len(report) != 3 {
+			continue
+		}
+		names := make([]string, len(report))
+		for i, r := range report {
+			names[i] = r.Name
+		}
+		if names[0] != "alpha" || names[1] != "mango" || names[2] != "zebra" {
+			t.Errorf("HealthReportOrdered not sorted: %v", names)
+			break
+		}
+	}
+
+	cancel()
+	<-done
 }

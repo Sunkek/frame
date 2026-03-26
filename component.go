@@ -6,8 +6,6 @@ import (
 )
 
 // Tier expresses how important a component is to overall application health.
-// It controls both the readiness signal exposed by HealthServer and whether a
-// persistent failure triggers a full application shutdown.
 type Tier int
 
 const (
@@ -17,12 +15,12 @@ const (
 
 	// TierSignificant — a persistently unhealthy significant component marks
 	// the application as not-ready (/readyz returns 503) but does not trigger
-	// a shutdown. A permanent failure (retries exhausted) still shuts the app down.
+	// a shutdown. A permanent failure still shuts the app down.
 	TierSignificant
 
 	// TierAuxiliary — health problems are logged and hooks are fired, but they
 	// have no effect on /readyz and do not trigger a shutdown. Even a permanent
-	// failure only removes the component from the supervisor; the app continues.
+	// failure only removes the component from monitoring; the app continues.
 	TierAuxiliary
 )
 
@@ -42,30 +40,45 @@ func (t Tier) String() string {
 // Component is the fundamental unit managed by the Supervisor.
 //
 // Start must block for the entire lifetime of the component. It should return
-// nil when it exits cleanly (e.g. because ctx was cancelled) and a non-nil
-// error on unexpected failure. The supervisor calls Stop to request a graceful
-// exit; the component must honour that by unblocking Start promptly.
+// nil when it exits cleanly (ctx was cancelled or Stop was called) and a
+// non-nil error on unexpected failure.
 //
-// Stop is called with a fresh context that carries the configured stop timeout,
-// giving the component a bounded window to flush state and release resources.
+// Stop is called with a fresh context carrying the configured stop timeout.
 // Stop must not block longer than that context allows.
 type Component interface {
-	// Name returns a stable, unique identifier for this component. It is used
-	// in logs, hooks, dependency declarations, and health responses.
 	Name() string
-
-	// Start runs the component. It must block until the component has exited.
 	Start(ctx context.Context) error
-
-	// Stop signals the component to exit and waits for it to do so.
 	Stop(ctx context.Context) error
 }
 
-// HealthChecker is an optional extension of Component. When a component
-// implements this interface the supervisor polls it on the configured
-// healthInterval and acts on the result according to the component's Tier.
+// HealthChecker is an optional extension of Component. When implemented, the
+// supervisor polls Health on the configured healthInterval and acts on the
+// result according to the component's Tier.
 type HealthChecker interface {
 	Health(ctx context.Context) error
+}
+
+// Starter is an optional extension of Component. When implemented, the
+// supervisor calls Started() immediately after Start() is launched and blocks
+// on the returned channel before proceeding to the next component. This
+// provides precise readiness signalling without relying on the probe-window
+// heuristic.
+//
+// The channel must be closed (not sent to) when the component is ready to
+// serve traffic. It must never be closed before Start() is called.
+//
+// Example:
+//
+//	type MyServer struct { ready chan struct{} }
+//	func (s *MyServer) Started() <-chan struct{} { return s.ready }
+//	func (s *MyServer) Start(ctx context.Context) error {
+//	    ln, err := net.Listen("tcp", s.addr)
+//	    if err != nil { return err }
+//	    close(s.ready)          // signal ready — supervisor proceeds
+//	    return s.srv.Serve(ln)  // blocks
+//	}
+type Starter interface {
+	Started() <-chan struct{}
 }
 
 // ComponentOption configures a managedComponent at registration time.
@@ -77,22 +90,19 @@ type componentConfig struct {
 	deps          []string
 }
 
-// WithTier sets the importance tier of a component.
-// Defaults to TierCritical when not specified.
+// WithTier sets the importance tier of a component. Defaults to TierCritical.
 func WithTier(t Tier) ComponentOption {
 	return func(c *componentConfig) { c.tier = t }
 }
 
-// WithRestartPolicy sets the restart policy applied when a component's Start
-// returns an error or its Health check fails persistently.
-// Defaults to NeverRestart() when not specified.
+// WithRestartPolicy sets the restart policy. Defaults to NeverRestart().
 func WithRestartPolicy(p RestartPolicy) ComponentOption {
 	return func(c *componentConfig) { c.restartPolicy = p }
 }
 
 // WithDependencies declares that this component must not be started until all
-// named dependencies are running and healthy (if they implement HealthChecker).
-// Names must match Component.Name() of other registered components.
+// named dependencies are running. Names must match Component.Name() of other
+// registered components.
 func WithDependencies(names ...string) ComponentOption {
 	return func(c *componentConfig) { c.deps = append(c.deps, names...) }
 }

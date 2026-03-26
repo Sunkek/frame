@@ -3,6 +3,7 @@ package frame
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,8 +12,8 @@ import (
 // healthStatus holds the last observed health state of a component.
 type healthStatus struct {
 	mu      sync.RWMutex
-	err     error // nil means healthy
-	present bool  // false until the first health check completes
+	err     error
+	present bool // false until the first health check completes
 }
 
 func (h *healthStatus) set(err error) {
@@ -40,6 +41,7 @@ type supervisorConfig struct {
 	startProbeWindow   time.Duration
 	logger             Logger
 	hooks              *EventHooks
+	metrics            MetricsObserver
 }
 
 func WithHealthInterval(d time.Duration) SupervisorOption {
@@ -62,6 +64,14 @@ func WithRestartResetWindow(d time.Duration) SupervisorOption {
 	return func(c *supervisorConfig) { c.restartResetWindow = d }
 }
 
+// WithStartProbeWindow overrides how long the supervisor waits after calling
+// Start before assuming the component is alive and blocking.
+// Only applies to components that do not implement the Starter interface.
+// The default (100ms) is suitable for production; tests may use a lower value.
+func WithStartProbeWindow(d time.Duration) SupervisorOption {
+	return func(c *supervisorConfig) { c.startProbeWindow = d }
+}
+
 func WithSupervisorLogger(l Logger) SupervisorOption {
 	return func(c *supervisorConfig) { c.logger = l }
 }
@@ -70,22 +80,19 @@ func WithEventHooks(h *EventHooks) SupervisorOption {
 	return func(c *supervisorConfig) { c.hooks = h }
 }
 
-// WithStartProbeWindow overrides how long the supervisor waits after calling
-// Start before assuming the component is alive and blocking. The default
-// (100 ms) is a good production value; tests may set this lower to speed up
-// failure detection in retry scenarios.
-func WithStartProbeWindow(d time.Duration) SupervisorOption {
-	return func(c *supervisorConfig) { c.startProbeWindow = d }
+// WithMetricsObserver registers a MetricsObserver that will receive telemetry
+// events from the supervisor. See MetricsObserver for details.
+func WithMetricsObserver(m MetricsObserver) SupervisorOption {
+	return func(c *supervisorConfig) { c.metrics = m }
 }
 
 // Supervisor starts, monitors, and stops a set of Components in dependency
 // order. Components are started sequentially (dependencies first) and stopped
-// in reverse order (dependents first), giving each layer a clean shutdown
-// window before its dependencies disappear.
+// in reverse order (dependents first).
 type Supervisor struct {
 	// registration-time state (written before Run, read-only after)
 	components     map[string]*managedComponent
-	insertionOrder []string            // preserves Add() call order for stable topo sort
+	insertionOrder []string            // preserves Add() order for stable topo sort
 	order          []*managedComponent // topological order, set in Run
 
 	// configuration (immutable after construction)
@@ -97,10 +104,12 @@ type Supervisor struct {
 	startProbeWindow   time.Duration
 	logger             Logger
 	hooks              *EventHooks
+	metrics            MetricsObserver
 
 	// runtime state
-	running  int32 // 0 = not started, 1 = started (atomic)
-	statuses map[string]*healthStatus
+	running   int32           // 0 = not started, 1 = started (atomic)
+	statusMu  sync.RWMutex   // guards statuses map assignment and iteration
+	statuses  map[string]*healthStatus
 }
 
 // NewSupervisor constructs a Supervisor with the given options.
@@ -113,6 +122,7 @@ func NewSupervisor(opts ...SupervisorOption) *Supervisor {
 		restartResetWindow: defaultRestartResetWindow,
 		startProbeWindow:   defaultStartProbeWindow,
 		logger:             newNopLogger(),
+		metrics:            newNopMetrics(),
 	}
 	for _, o := range opts {
 		if o != nil {
@@ -128,18 +138,16 @@ func NewSupervisor(opts ...SupervisorOption) *Supervisor {
 		startProbeWindow:   cfg.startProbeWindow,
 		logger:             cfg.logger,
 		hooks:              cfg.hooks,
+		metrics:            cfg.metrics,
 	}
 }
 
-// Add registers a Component with the Supervisor. It panics if called after Run
-// has started, or if a component with the same name is already registered.
-// Panicking here follows the same convention as http.Handle — these are
-// programmer errors that should surface immediately during startup.
+// Add registers a Component with the Supervisor. Panics if called after Run
+// has started or if a component with the same name is already registered.
 func (s *Supervisor) Add(c Component, opts ...ComponentOption) {
 	if atomic.LoadInt32(&s.running) == 1 {
 		panic(ErrSupervisorRunning)
 	}
-
 	cfg := componentConfig{
 		tier:          TierCritical,
 		restartPolicy: NeverRestart(),
@@ -149,7 +157,6 @@ func (s *Supervisor) Add(c Component, opts ...ComponentOption) {
 			o(&cfg)
 		}
 	}
-
 	if s.components == nil {
 		s.components = make(map[string]*managedComponent)
 	}
@@ -167,26 +174,84 @@ func (s *Supervisor) Add(c Component, opts ...ComponentOption) {
 }
 
 // ComponentHealth returns the last known health error for a named component,
-// or nil if it is healthy. The second return value is false when no health
-// check has been recorded yet (component still starting up).
+// or nil if healthy. The second return value is false when no health check has
+// been recorded yet.
 func (s *Supervisor) ComponentHealth(name string) (err error, known bool) {
-	if s.statuses == nil {
-		return nil, false
-	}
+	s.statusMu.RLock()
 	hs, ok := s.statuses[name]
+	s.statusMu.RUnlock()
 	if !ok {
 		return nil, false
 	}
-	e, present := hs.get()
-	return e, present
+	return hs.get()
+}
+
+// HealthReport returns a snapshot of all component health states, keyed by
+// component name. Results are sorted by name for deterministic iteration.
+// Intended for use by HealthServer and custom reporters.
+func (s *Supervisor) HealthReport() map[string]ComponentStatus {
+	s.statusMu.RLock()
+	statuses := s.statuses
+	s.statusMu.RUnlock()
+	if statuses == nil {
+		return nil
+	}
+	out := make(map[string]ComponentStatus, len(statuses))
+	for name, hs := range statuses {
+		err, known := hs.get()
+		mc := s.components[name]
+		out[name] = ComponentStatus{
+			Err:   err,
+			Known: known,
+			Tier:  mc.tier,
+		}
+	}
+	return out
+}
+
+// HealthReportOrdered returns the same data as HealthReport but as a sorted
+// slice, which is useful when order matters (e.g. rendering JSON responses
+// where deterministic output is important for diffing and testing).
+func (s *Supervisor) HealthReportOrdered() []NamedComponentStatus {
+	s.statusMu.RLock()
+	statuses := s.statuses
+	s.statusMu.RUnlock()
+	if statuses == nil {
+		return nil
+	}
+	out := make([]NamedComponentStatus, 0, len(statuses))
+	for name, hs := range statuses {
+		err, known := hs.get()
+		mc := s.components[name]
+		out = append(out, NamedComponentStatus{
+			Name: name,
+			ComponentStatus: ComponentStatus{
+				Err:   err,
+				Known: known,
+				Tier:  mc.tier,
+			},
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// NamedComponentStatus is a ComponentStatus paired with its component name,
+// used by HealthReportOrdered for sorted, slice-based iteration.
+type NamedComponentStatus struct {
+	Name string
+	ComponentStatus
+}
+
+// ComponentStatus is a point-in-time snapshot of a single component's health.
+type ComponentStatus struct {
+	Err   error // nil means healthy
+	Known bool  // false until the first health check runs
+	Tier  Tier
 }
 
 // Run starts all registered components in dependency order, monitors them, and
 // blocks until ctx is cancelled or a critical failure occurs.
-//
-// On shutdown, components are stopped in reverse start order, each within the
-// configured stop timeout. Run returns the first critical error encountered, or
-// nil on a clean shutdown.
 func (s *Supervisor) Run(ctx context.Context) error {
 	atomic.StoreInt32(&s.running, 1)
 
@@ -196,173 +261,141 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	s.order = ordered
 
-	// Initialise health status map for all components.
+	s.statusMu.Lock()
 	s.statuses = make(map[string]*healthStatus, len(ordered))
 	for _, mc := range ordered {
 		s.statuses[mc.component.Name()] = &healthStatus{}
 	}
+	s.statusMu.Unlock()
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
-	// started tracks which components reached the running state, in order.
-	// Only these will be stopped on shutdown.
 	started := make([]*managedComponent, 0, len(ordered))
-
-	// criticalErrCh carries the first critical error that demands a shutdown.
 	criticalErrCh := make(chan error, len(ordered))
-
-	// wg tracks all per-component manage goroutines so we can drain them before
-	// calling stopAll.
 	var wg sync.WaitGroup
 
 	for _, mc := range ordered {
-		// launch launches Start in a goroutine and returns a channel that
-		// delivers exactly one value: nil when the component is ready (Start
-		// returned without error AND the first health check passed), or the
-		// error that caused the start attempt to fail.
-		//
-		// The goroutine keeps running after readyCh fires; it owns the
-		// component's lifetime and will call cancel() on a critical failure.
-		readyCh, startErrCh := s.launch(ctx, mc, cancel, criticalErrCh, &wg)
+		readyCh, startErrCh := s.launch(ctx, cancel, mc, criticalErrCh, &wg)
 
-		// Block until this component is ready before moving on to the next one.
-		// This enforces the sequential, dependency-ordered startup guarantee.
 		select {
 		case err := <-readyCh:
 			if err != nil {
-				// The component failed to start (retries exhausted).
-				// Stop everything that is already running, then return.
+				// Component failed to start permanently; stop everything already
+				// running and return the error.
 				s.stopAll(started)
-				// Drain the startErrCh so the goroutine can exit.
 				<-startErrCh
 				return err
 			}
+			// Component is running — add to the started set so it gets stopped
+			// during shutdown.
+			started = append(started, mc)
+
 		case <-ctx.Done():
-			// A previously launched component signalled a critical failure
-			// while we were waiting for this one to become ready.
+			// A previously launched component triggered shutdown (or the caller
+			// cancelled) while we were waiting for this component to become ready.
+			// Include the in-flight component in the stop list so it is always
+			// cleaned up, then drain its goroutine.
+			started = append(started, mc)
 			s.stopAll(started)
 			<-startErrCh
-			break
+			if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+				return cause
+			}
+			return nil
 		}
-
-		started = append(started, mc)
 	}
 
-	// Wait for the context to be cancelled (OS signal, Application shutdown, or
-	// a critical component failure that called cancel() above).
 	<-ctx.Done()
-
-	// Drain all manage goroutines before stopping components so we don't race
-	// on component state.
 	wg.Wait()
 	close(criticalErrCh)
-
-	// Stop all started components in reverse order.
 	s.stopAll(started)
 
-	// Return the first critical error, if any.
 	for err := range criticalErrCh {
 		if err != nil {
 			return err
 		}
 	}
+
+	// Surface the cancellation cause if it was set by a component failure.
+	if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+		return cause
+	}
 	return nil
 }
 
-// launch starts a component's goroutine. It returns:
-//   - readyCh: receives nil when the component is ready, or an error if it
-//     failed to start permanently. Closes after sending exactly one value.
-//   - startErrCh: receives the goroutine's final exit error (always closes).
-//
-// The goroutine increments wg before launch returns and decrements it when it
-// exits so the caller can wait for all goroutines to finish.
+// launch starts a component's goroutine and returns:
+//   - readyCh: receives nil when ready, error if permanently failed.
+//   - startErrCh: closed when the goroutine exits (used to synchronise cleanup).
 func (s *Supervisor) launch(
 	ctx context.Context,
+	cancel context.CancelCauseFunc,
 	mc *managedComponent,
-	cancel context.CancelFunc,
 	criticalErrCh chan<- error,
 	wg *sync.WaitGroup,
-) (<-chan error, <-chan error) {
+) (<-chan error, <-chan struct{}) {
 	readyCh := make(chan error, 1)
-	startErrCh := make(chan error, 1)
+	startErrCh := make(chan struct{})
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(startErrCh)
 
-		// startAndSignal starts the component, waits for it to report healthy
-		// (if it implements HealthChecker), then signals readyCh exactly once.
-		// Returns true if the component is now confirmed running, false if it
-		// failed permanently.
-		startAndSignal := func() bool {
-			err := s.startOne(ctx, mc)
-			if err != nil {
-				readyCh <- err
-				return false
-			}
-			// If the component exposes health, do an initial poll now so that
-			// dependents are not launched until this component is confirmed
-			// healthy. This is the sequential readiness guarantee.
-			if hc, ok := mc.component.(HealthChecker); ok {
-				if err := s.waitUntilHealthy(ctx, mc.component.Name(), hc); err != nil {
-					readyCh <- err
-					return false
-				}
-			}
-			readyCh <- nil
-			return true
-		}
-
-		if !startAndSignal() {
-			startErrCh <- nil // error already sent on readyCh
+		err := s.startOne(ctx, mc)
+		if err != nil {
+			readyCh <- err
 			return
 		}
+		readyCh <- nil
 
-		// Component is running. Hand off to the health/restart monitor.
 		if err := s.manage(ctx, mc, cancel); err != nil {
 			criticalErrCh <- err
-			cancel()
+			cancel(err)
 		}
 	}()
 
 	return readyCh, startErrCh
 }
 
-// startOne attempts to start mc, honouring the restart policy on failure.
-// It returns nil only when the component's Start call has returned without
-// error AND the first health check (if applicable) has passed.
-// It returns an error when all retries are exhausted or ctx is cancelled.
+// startOne starts mc and blocks until it is ready. For components implementing
+// Starter, it waits for the Started() channel to close (bounded by
+// startTimeout). For all others it waits up to startProbeWindow for Start to
+// fail; if Start is still running the component is assumed alive.
 //
-// Because Start is defined as a blocking call (it runs for the component's
-// entire lifetime), startOne runs Start in its own goroutine and blocks on a
-// "ready" signal instead.
+// # Goroutine ownership
+//
+// startOne spawns exactly one goroutine per attempt to run Start(ctx).
+// On a failed attempt (startErr != nil) startOne either drains startExit
+// synchronously (ctx cancelled path) or lets the loop continue — on the next
+// iteration a fresh goroutine is spawned and the old one will exit on its own
+// once ctx is cancelled or Stop is called.
+//
+// On a successful attempt startOne returns without waiting for Start to finish
+// (Start intentionally blocks for the component's lifetime). The goroutine
+// running Start is then "owned" by the component itself: it will exit when
+// ctx is cancelled or when doStop calls Stop(). Because startExit is a
+// buffered channel of size 1 the goroutine can always send without blocking
+// even if nobody is reading, so there is no goroutine leak.
+//
+// Returns nil when the component is running, error if all retries are exhausted.
 func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 	name := mc.component.Name()
-	attempt := 0
 
-	for {
+	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
-			return nil // parent is shutting down; not our error
+			return nil
 		}
 
 		s.logger.Info("component starting", "component", name, "attempt", attempt)
 
-		// Run Start in a goroutine; it blocks for the component's lifetime.
-		// startExit is closed when Start returns.
+		// startExit is buffered so the Start goroutine can always send without
+		// blocking, regardless of whether startOne is still waiting on it.
 		startExit := make(chan error, 1)
-		go func() {
-			startExit <- mc.component.Start(ctx)
-		}()
+		go func() { startExit <- mc.component.Start(ctx) }()
 
-		// Wait for a brief window so that a component that fails immediately
-		// (e.g. cannot bind a port) is detected before we do the health check.
-		// For components that start successfully, Start will not return until
-		// Stop is called, so we proceed after the timeout.
-		startErr := s.waitForStartOrFail(ctx, startExit)
+		startErr := s.waitForReady(ctx, mc.component, startExit)
 		if startErr != nil {
-			// Start returned an error quickly.
 			s.logger.Error("component start failed",
 				"component", name, "error", startErr, "attempt", attempt)
 
@@ -371,32 +404,57 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 				s.hooks.fireFailed(name, startErr)
 				return fmt.Errorf("component %q failed to start: %w", name, startErr)
 			}
-
 			s.hooks.fireRestart(name, startErr, attempt+1)
+			s.metrics.ComponentRestarting(name, startErr, attempt+1, delay)
 			s.logger.Info("component will restart",
 				"component", name, "delay", delay, "next_attempt", attempt+1)
-
 			select {
 			case <-ctx.Done():
+				<-startExit // drain so the goroutine exits cleanly
 				return nil
 			case <-time.After(delay):
 			}
-			attempt++
 			continue
 		}
 
-		// Start is blocking (component is alive). Consider it ready — manage
-		// owns all health checking from this point forward.
+		// Component is running. The goroutine running Start(ctx) is now owned
+		// by the component's lifetime — it exits when ctx is cancelled or
+		// doStop calls Stop(). See goroutine ownership note above.
 		s.logger.Info("component started", "component", name)
+		s.metrics.ComponentStarted(name, attempt)
 		return nil
 	}
 }
 
-// waitForStartOrFail waits for a brief window (startProbeWindow) to see if
-// Start returns an error immediately (e.g. bind failure, init error). If Start
-// is still running after the window we assume it is blocking successfully and
-// return nil.
-func (s *Supervisor) waitForStartOrFail(ctx context.Context, startExit <-chan error) error {
+// waitForReady waits for a component to signal readiness.
+//
+// If the component implements Starter, it waits for Started() to close,
+// bounded by startTimeout. A component that fails to signal readiness within
+// startTimeout is treated as a failed start attempt.
+//
+// Otherwise it waits up to startProbeWindow for Start to return an error.
+// If Start is still running after the probe window the component is assumed
+// to be blocking normally and is considered alive.
+func (s *Supervisor) waitForReady(ctx context.Context, c Component, startExit <-chan error) error {
+	if st, ok := c.(Starter); ok {
+		// Apply startTimeout so a component that never closes its Started()
+		// channel does not block the supervisor indefinitely.
+		timer := time.NewTimer(s.startTimeout)
+		defer timer.Stop()
+		select {
+		case err := <-startExit:
+			// Start returned before signalling ready — treat as a failure.
+			return err
+		case <-st.Started():
+			return nil
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+			return fmt.Errorf("component did not signal readiness within %s", s.startTimeout)
+		}
+	}
+
+	// Probe-window fallback for components without Starter.
 	timer := time.NewTimer(s.startProbeWindow)
 	defer timer.Stop()
 	select {
@@ -405,45 +463,28 @@ func (s *Supervisor) waitForStartOrFail(ctx context.Context, startExit <-chan er
 	case <-ctx.Done():
 		return nil
 	case <-timer.C:
-		// Start is still blocking — component is alive.
 		return nil
 	}
 }
 
-// waitUntilHealthy performs a single health check after startOne succeeds.
-// It gives the component one healthTimeout window to report healthy before
-// declaring it ready. If the check fails or the context is cancelled we
-// proceed anyway — manage owns all ongoing health logic and will react
-// immediately on its first tick.
+// manage runs the ongoing health-check loop for a running component. It
+// returns a non-nil error only when a critical/significant failure has
+// occurred and the application must shut down.
 //
-// This is purely a best-effort "did it come up cleanly?" signal so that
-// dependents are not started against a component that is already in a broken
-// state. It does not retry and does not fire any hooks.
-func (s *Supervisor) waitUntilHealthy(ctx context.Context, name string, hc HealthChecker) error {
-	hCtx, cancel := context.WithTimeout(ctx, s.healthTimeout)
-	defer cancel()
-	err := hc.Health(hCtx)
-	if err != nil {
-		s.logger.Debug("component not healthy at startup, manage will handle it",
-			"component", name, "error", err)
-	}
-	// Always return nil — we don't fail startup on an initial health miss.
-	// manage will detect and act on persistent unhealthy state.
-	return nil
-}
-
-// manage runs the ongoing health-check loop for a component that is already
-// started. It also handles restarts when health fails persistently.
+// # Goroutine model during restarts
 //
-// It returns a non-nil error only when a critical failure has occurred and the
-// application must shut down.
-func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel context.CancelFunc) error {
+// When a health check fails and the restart policy permits a retry, manage
+// calls doStop (which calls Stop, causing the Start goroutine spawned by the
+// most recent startOne call to exit), waits for the delay, then calls
+// startOne again. startOne spawns a fresh goroutine for the new Start call.
+// Each restart cycle therefore has exactly one live Start goroutine at a time.
+// manage itself runs inside the goroutine launched by launch and does not
+// spawn additional long-lived goroutines of its own.
+func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel context.CancelCauseFunc) error {
 	name := mc.component.Name()
 
 	hc, hasHealth := mc.component.(HealthChecker)
 	if !hasHealth {
-		// Component has no health interface — mark it healthy immediately so
-		// /readyz reflects its running state rather than "starting" forever.
 		s.statuses[name].set(nil)
 		<-ctx.Done()
 		return nil
@@ -462,11 +503,14 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 			return nil
 
 		case <-ticker.C:
+			t0 := time.Now()
 			hCtx, hCancel := context.WithTimeout(ctx, s.healthTimeout)
 			hErr := hc.Health(hCtx)
 			hCancel()
+			duration := time.Since(t0)
 
 			s.statuses[name].set(hErr)
+			s.metrics.HealthCheckCompleted(name, duration, hErr)
 
 			if hErr == nil {
 				if wasUnhealthy {
@@ -477,12 +521,10 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 				continue
 			}
 
-			// Component is unhealthy.
 			s.logger.Error("component unhealthy", "component", name, "error", hErr)
 			s.hooks.fireUnhealthy(name, hErr)
 			wasUnhealthy = true
 
-			// Reset attempt counter if the component was stable long enough.
 			if time.Since(startedAt) > s.restartResetWindow {
 				attempt = 0
 			}
@@ -495,10 +537,12 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 				return s.handlePermanentFailure(mc, hErr, cancel)
 			}
 
-			// Stop the component before restarting it.
-			_ = s.doStop(mc)
+			// Stop the component before restarting.
+			stopErr := s.doStop(mc)
+			s.metrics.ComponentStopped(name, stopErr)
 
 			s.hooks.fireRestart(name, hErr, attempt+1)
+			s.metrics.ComponentRestarting(name, hErr, attempt+1, delay)
 			s.logger.Info("component restarting after unhealthy",
 				"component", name, "delay", delay, "next_attempt", attempt+1)
 
@@ -508,8 +552,6 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 			case <-time.After(delay):
 			}
 
-			// Re-start the component inline (startOne spawns its own goroutine
-			// for Start, so this call returns as soon as the component is ready).
 			if err := s.startOne(ctx, mc); err != nil {
 				s.hooks.fireFailed(name, err)
 				return s.handlePermanentFailure(mc, err, cancel)
@@ -523,25 +565,25 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 }
 
 // handlePermanentFailure decides what to do when a component can no longer be
-// recovered. Critical and Significant components trigger a shutdown; Auxiliary
-// components are simply removed from monitoring.
-func (s *Supervisor) handlePermanentFailure(mc *managedComponent, err error, cancel context.CancelFunc) error {
+// recovered. Critical and Significant failures trigger a shutdown; Auxiliary
+// failures are logged and the component is simply removed from monitoring.
+func (s *Supervisor) handlePermanentFailure(mc *managedComponent, err error, cancel context.CancelCauseFunc) error {
 	name := mc.component.Name()
 	switch mc.tier {
 	case TierCritical:
-		s.logger.Error("critical component failed — shutting down application",
+		s.logger.Error("critical component failed — shutting down",
 			"component", name, "error", err)
-		cancel()
+		cancel(fmt.Errorf("critical component %q failed: %w", name, err))
 		return fmt.Errorf("critical component %q failed: %w", name, err)
 
 	case TierSignificant:
-		s.logger.Error("significant component failed permanently — shutting down application",
+		s.logger.Error("significant component failed permanently — shutting down",
 			"component", name, "error", err)
-		cancel()
+		cancel(fmt.Errorf("significant component %q failed: %w", name, err))
 		return fmt.Errorf("significant component %q failed: %w", name, err)
 
 	default: // TierAuxiliary
-		s.logger.Error("auxiliary component failed permanently — continuing without it",
+		s.logger.Error("auxiliary component failed permanently — continuing",
 			"component", name, "error", err)
 		return nil
 	}
@@ -562,16 +604,17 @@ func (s *Supervisor) doStop(mc *managedComponent) error {
 	return err
 }
 
-// stopAll stops the supplied components in reverse order (last started → first
-// stopped). Errors are logged but do not prevent subsequent stops.
+// stopAll stops components in reverse order, logging but not returning errors.
 func (s *Supervisor) stopAll(components []*managedComponent) {
 	for i := len(components) - 1; i >= 0; i-- {
-		_ = s.doStop(components[i])
+		err := s.doStop(components[i])
+		s.metrics.ComponentStopped(components[i].component.Name(), err)
 	}
 }
 
-// topoSort returns all registered components in topological dependency order
-// using an iterative DFS. An error is returned on cycles or unknown deps.
+// topoSort returns components in topological dependency order. Insertion order
+// is the stable tiebreaker for components with no declared dependency between
+// them, so Add() call order is always respected.
 func (s *Supervisor) topoSort() ([]*managedComponent, error) {
 	visited := make(map[string]bool, len(s.components))
 	inStack := make(map[string]bool, len(s.components))
@@ -601,9 +644,6 @@ func (s *Supervisor) topoSort() ([]*managedComponent, error) {
 		return nil
 	}
 
-	// Drive the outer loop from insertionOrder so that components with no
-	// declared dependency between them are started in Add() call order.
-	// This makes registration order the stable, predictable tiebreaker.
 	for _, name := range s.insertionOrder {
 		if err := visit(name); err != nil {
 			return nil, err

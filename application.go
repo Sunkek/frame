@@ -29,8 +29,7 @@ func WithMainFunc(f func(ctx context.Context) error) ApplicationOption {
 }
 
 // WithSupervisor attaches a Supervisor to the application. The supervisor is
-// started before the main function and is the first thing to receive the
-// shutdown signal.
+// started alongside the main function and both receive the same root context.
 func WithSupervisor(s *Supervisor) ApplicationOption {
 	return func(c *applicationConfig) { c.supervisor = s }
 }
@@ -73,9 +72,8 @@ type Application struct {
 	shutdownTimeout time.Duration
 	logger          Logger
 
-	// cancelRoot is stored so that Shutdown() can be called from outside Run.
 	mu         sync.Mutex
-	cancelRoot context.CancelFunc
+	cancelRoot context.CancelCauseFunc
 }
 
 // NewApplication constructs an Application with the supplied options.
@@ -97,28 +95,32 @@ func NewApplication(opts ...ApplicationOption) *Application {
 	}
 }
 
-// Shutdown cancels the application's root context from outside Run, triggering
-// a graceful shutdown. It is safe to call from any goroutine, including before
-// Run returns. Calling Shutdown before Run is a no-op.
-func (a *Application) Shutdown() {
+// Shutdown cancels the application's root context, triggering a graceful
+// shutdown. The optional cause is attached to the context so that components
+// and the main function can inspect it via context.Cause if needed.
+//
+// It is safe to call from any goroutine. Calling Shutdown before Run is a
+// no-op. Calling it multiple times is safe; only the first cause is recorded.
+func (a *Application) Shutdown(cause error) {
 	a.mu.Lock()
 	cancel := a.cancelRoot
 	a.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel(cause)
 	}
 }
 
 // Run starts the application and blocks until it exits.
 //
 // Startup order:
-//  1. Root context is created and wired to OS signals (SIGINT, SIGTERM, SIGHUP, SIGQUIT).
+//  1. Root context is created and wired to OS signals (SIGINT, SIGTERM,
+//     SIGHUP, SIGQUIT).
 //  2. Supervisor.Run is launched in a goroutine (if a Supervisor was provided).
 //  3. The main function is launched in a goroutine (if one was provided).
 //
 // Shutdown is triggered by any of:
 //   - An OS signal.
-//   - A call to Application.Shutdown().
+//   - A call to Application.Shutdown(cause).
 //   - The main function returning (with or without an error).
 //   - The Supervisor encountering a critical failure.
 //
@@ -130,7 +132,6 @@ func (a *Application) Run() error {
 		return ErrMainOmitted
 	}
 
-	// Build the root context, wired to OS shutdown signals.
 	sigCtx, stopSig := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -140,10 +141,10 @@ func (a *Application) Run() error {
 	)
 	defer stopSig()
 
-	// Wrap with a cancel we control so that Shutdown() and internal failures
-	// can also trigger a clean exit.
-	rootCtx, cancelRoot := context.WithCancel(sigCtx)
-	defer cancelRoot()
+	// WithCancelCause lets Shutdown() and internal failures attach a reason to
+	// the context, which components can inspect via context.Cause(ctx).
+	rootCtx, cancelRoot := context.WithCancelCause(sigCtx)
+	defer cancelRoot(nil)
 
 	a.mu.Lock()
 	a.cancelRoot = cancelRoot
@@ -151,7 +152,6 @@ func (a *Application) Run() error {
 
 	a.logger.Info("application starting")
 
-	// errCh collects errors from the supervisor and main goroutines.
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 
@@ -162,7 +162,7 @@ func (a *Application) Run() error {
 			if err := a.supervisor.Run(rootCtx); err != nil {
 				a.logger.Error("supervisor exited with error", "error", err)
 				errCh <- err
-				cancelRoot()
+				cancelRoot(err)
 			}
 		}()
 	}
@@ -175,18 +175,15 @@ func (a *Application) Run() error {
 				a.logger.Error("main function exited with error", "error", err)
 				errCh <- err
 			}
-			// Whether main returns an error or not, trigger shutdown so the
-			// supervisor and other goroutines are notified.
-			cancelRoot()
+			// Always cancel on main exit so supervisor and other goroutines
+			// are notified, whether or not main returned an error.
+			cancelRoot(nil)
 		}()
 	}
 
-	// Wait for the root context to be cancelled (signal, Shutdown(), or an
-	// internal failure from one of the goroutines above).
 	<-rootCtx.Done()
 	a.logger.Info("application shutting down")
 
-	// Give goroutines a bounded window to finish cleanly.
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -196,7 +193,6 @@ func (a *Application) Run() error {
 	var timeoutErr error
 	select {
 	case <-done:
-		// Clean exit.
 	case <-time.After(a.shutdownTimeout):
 		a.logger.Error("shutdown timeout exceeded", "timeout", a.shutdownTimeout)
 		timeoutErr = ErrShutdownTimeout

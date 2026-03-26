@@ -9,11 +9,18 @@ import (
 	"time"
 )
 
-// healthStatus string values used in JSON responses.
 const (
 	statusOK      = "ok"
 	statusDegraded = "degraded"
 )
+
+// HealthReporter is the interface the HealthServer uses to query component
+// health. *Supervisor satisfies this interface via both HealthReport() and
+// HealthReportOrdered(). You can also implement it yourself for testing or
+// custom aggregation.
+type HealthReporter interface {
+	HealthReportOrdered() []NamedComponentStatus
+}
 
 // HealthServerOption configures a HealthServer.
 type HealthServerOption func(*healthServerConfig)
@@ -25,60 +32,46 @@ type healthServerConfig struct {
 	logger       Logger
 }
 
-// WithHealthAddr sets the TCP address the server listens on.
-// Defaults to ":8080".
 func WithHealthAddr(addr string) HealthServerOption {
 	return func(c *healthServerConfig) { c.addr = addr }
 }
 
-// WithHealthReadTimeout overrides the HTTP read timeout.
 func WithHealthReadTimeout(d time.Duration) HealthServerOption {
 	return func(c *healthServerConfig) { c.readTimeout = d }
 }
 
-// WithHealthWriteTimeout overrides the HTTP write timeout.
 func WithHealthWriteTimeout(d time.Duration) HealthServerOption {
 	return func(c *healthServerConfig) { c.writeTimeout = d }
 }
 
-// WithHealthLogger sets the logger used by the health server.
 func WithHealthLogger(l Logger) HealthServerOption {
 	return func(c *healthServerConfig) { c.logger = l }
 }
 
-// HealthServer is a Component that exposes three HTTP endpoints for
-// orchestrators and load balancers:
+// HealthServer is a Component that exposes three HTTP endpoints:
 //
-//	GET /livez   — liveness probe: 200 while the process is alive.
-//	GET /readyz  — readiness probe: 200 if all Critical/Significant components
-//	              are healthy, 503 otherwise. Body contains per-component detail.
-//	GET /healthz — alias for /readyz (Docker HEALTHCHECK compatibility).
+//	GET /livez   — liveness:  200 while the process is alive
+//	GET /readyz  — readiness: 200 if all Critical/Significant components are healthy
+//	GET /healthz — alias for /readyz (Docker HEALTHCHECK compatibility)
 //
-// Register HealthServer as the first component in the Supervisor so that it
-// starts before everything else (immediately serving /livez 200 and
-// /readyz 503 while dependencies initialise) and stops last during shutdown
-// (keeping the orchestrator informed until the very end).
-//
-// Example:
-//
-//	hs := frame.NewHealthServer(sup)
-//	sup.Add(hs, frame.WithTier(frame.TierCritical))  // register first
-//	sup.Add(myDB)
-//	sup.Add(myCache, frame.WithTier(frame.TierSignificant))
+// Register HealthServer first with the Supervisor so it starts before all
+// other components (serving /livez 200 and /readyz 503 during startup) and
+// stops last (keeping the orchestrator informed during shutdown).
 type HealthServer struct {
-	supervisor *Supervisor
-	addr       string
-	server     *http.Server
-	logger     Logger
+	reporter HealthReporter
+	addr     string
+	server   *http.Server
+	logger   Logger
+	readyCh  chan struct{} // closed when the TCP listener is bound
 
-	// ready tracks whether Start has completed without error.
 	mu    sync.RWMutex
 	alive bool
 }
 
-// NewHealthServer creates a HealthServer backed by the given Supervisor for
-// component health aggregation.
-func NewHealthServer(sup *Supervisor, opts ...HealthServerOption) *HealthServer {
+// NewHealthServer creates a HealthServer that uses reporter to aggregate
+// component health for /readyz. Pass a *Supervisor directly — it satisfies
+// HealthReporter via its HealthReport() method.
+func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *HealthServer {
 	cfg := healthServerConfig{
 		addr:         defaultHealthAddr,
 		readTimeout:  defaultHealthReadTimeout,
@@ -92,15 +85,16 @@ func NewHealthServer(sup *Supervisor, opts ...HealthServerOption) *HealthServer 
 	}
 
 	hs := &HealthServer{
-		supervisor: sup,
-		addr:       cfg.addr,
-		logger:     cfg.logger,
+		reporter: reporter,
+		addr:     cfg.addr,
+		logger:   cfg.logger,
+		readyCh:  make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", hs.handleLivez)
 	mux.HandleFunc("/readyz", hs.handleReadyz)
-	mux.HandleFunc("/healthz", hs.handleReadyz) // alias
+	mux.HandleFunc("/healthz", hs.handleReadyz)
 
 	hs.server = &http.Server{
 		Addr:         cfg.addr,
@@ -112,6 +106,11 @@ func NewHealthServer(sup *Supervisor, opts ...HealthServerOption) *HealthServer 
 }
 
 func (h *HealthServer) Name() string { return "health-server" }
+
+// Started implements Starter. The channel is closed the moment the TCP
+// listener is bound — before Serve blocks — giving the supervisor a precise
+// readiness signal rather than relying on the probe-window heuristic.
+func (h *HealthServer) Started() <-chan struct{} { return h.readyCh }
 
 // Start begins listening and serving. It blocks until the server is shut down.
 func (h *HealthServer) Start(_ context.Context) error {
@@ -127,6 +126,7 @@ func (h *HealthServer) Start(_ context.Context) error {
 	h.mu.Unlock()
 
 	h.logger.Info("health server listening", "addr", h.addr)
+	close(h.readyCh) // signal supervisor: TCP port is bound, ready to serve
 
 	if err := h.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
@@ -139,12 +139,10 @@ func (h *HealthServer) Stop(ctx context.Context) error {
 	h.mu.Lock()
 	h.alive = false
 	h.mu.Unlock()
-
 	h.logger.Info("health server stopping")
 	return h.server.Shutdown(ctx)
 }
 
-// handleLivez responds 200 OK as long as the process is alive.
 func (h *HealthServer) handleLivez(w http.ResponseWriter, _ *http.Request) {
 	h.mu.RLock()
 	alive := h.alive
@@ -160,50 +158,39 @@ func (h *HealthServer) handleLivez(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"degraded"}`))
 }
 
-// componentHealthDetail is the per-component entry in a /readyz response.
 type componentHealthDetail struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 }
 
-// readyzResponse is the full /readyz JSON body.
 type readyzResponse struct {
 	Status     string                  `json:"status"`
 	Components []componentHealthDetail `json:"components"`
 }
 
-// handleReadyz aggregates the health of all registered components and responds
-// 200 if all Critical and Significant components are healthy, 503 otherwise.
 func (h *HealthServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
-	if h.supervisor == nil {
-		// No supervisor — just mirror liveness.
+	if h.reporter == nil {
 		h.handleLivez(w, nil)
 		return
 	}
 
+	// HealthReportOrdered returns components sorted by name, so the JSON
+	// response is always deterministic regardless of map iteration order.
+	report := h.reporter.HealthReportOrdered()
 	allHealthy := true
-	details := make([]componentHealthDetail, 0, len(h.supervisor.statuses))
+	details := make([]componentHealthDetail, 0, len(report))
 
-	for name, hs := range h.supervisor.statuses {
-		err, known := hs.get()
-		detail := componentHealthDetail{Name: name, Status: statusOK}
+	for _, status := range report {
+		detail := componentHealthDetail{Name: status.Name, Status: statusOK}
 
-		if known && err != nil {
-			// A known, non-nil error means the component is actively unhealthy.
+		if status.Known && status.Err != nil {
 			detail.Status = statusDegraded
-			detail.Error = err.Error()
-
-			// Only Critical and Significant components affect the overall status.
-			mc := h.supervisor.components[name]
-			if mc != nil && mc.tier != TierAuxiliary {
+			detail.Error = status.Err.Error()
+			if status.Tier != TierAuxiliary {
 				allHealthy = false
 			}
 		}
-		// !known means the component hasn't been health-checked yet (e.g. it
-		// has no HealthChecker and manage hasn't run yet, or the supervisor
-		// hasn't started). Treat as healthy — we don't penalise components for
-		// being fast to start.
 
 		details = append(details, detail)
 	}
