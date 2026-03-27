@@ -39,15 +39,29 @@ func (t Tier) String() string {
 
 // Component is the fundamental unit managed by the Supervisor.
 //
-// Start must block for the entire lifetime of the component. It should return
-// nil when it exits cleanly (ctx was cancelled or Stop was called) and a
-// non-nil error on unexpected failure.
+// Start must block for the entire lifetime of the component. The ready
+// function must be called exactly once, as soon as the component is ready to
+// serve traffic. The supervisor will not start the next component until ready
+// is called. Start should return nil on a clean exit and a non-nil error on
+// unexpected failure.
 //
-// Stop is called with a fresh context carrying the configured stop timeout.
+// If ready is never called, the supervisor will wait up to startTimeout before
+// treating the attempt as a failure.
+//
+// Stop is called with a context carrying the configured stop timeout.
 // Stop must not block longer than that context allows.
+//
+// Example — an HTTP server:
+//
+//	func (s *Server) Start(ctx context.Context, ready func()) error {
+//	    ln, err := net.Listen("tcp", s.addr)
+//	    if err != nil { return err }
+//	    ready()                       // port is bound — supervisor proceeds
+//	    return s.srv.Serve(ln)        // blocks until Stop calls Shutdown
+//	}
 type Component interface {
 	Name() string
-	Start(ctx context.Context) error
+	Start(ctx context.Context, ready func()) error
 	Stop(ctx context.Context) error
 }
 
@@ -56,29 +70,6 @@ type Component interface {
 // result according to the component's Tier.
 type HealthChecker interface {
 	Health(ctx context.Context) error
-}
-
-// Starter is an optional extension of Component. When implemented, the
-// supervisor calls Started() immediately after Start() is launched and blocks
-// on the returned channel before proceeding to the next component. This
-// provides precise readiness signalling without relying on the probe-window
-// heuristic.
-//
-// The channel must be closed (not sent to) when the component is ready to
-// serve traffic. It must never be closed before Start() is called.
-//
-// Example:
-//
-//	type MyServer struct { ready chan struct{} }
-//	func (s *MyServer) Started() <-chan struct{} { return s.ready }
-//	func (s *MyServer) Start(ctx context.Context) error {
-//	    ln, err := net.Listen("tcp", s.addr)
-//	    if err != nil { return err }
-//	    close(s.ready)          // signal ready — supervisor proceeds
-//	    return s.srv.Serve(ln)  // blocks
-//	}
-type Starter interface {
-	Started() <-chan struct{}
 }
 
 // ComponentOption configures a managedComponent at registration time.

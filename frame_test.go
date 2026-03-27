@@ -50,12 +50,13 @@ func newMock(name string) *mockComponent {
 
 func (m *mockComponent) Name() string { return m.name }
 
-func (m *mockComponent) Start(ctx context.Context) error {
+func (m *mockComponent) Start(ctx context.Context, ready func()) error {
 	m.startCalled.Add(1)
 	if m.shouldFail.Load() {
 		return errFake
 	}
 	m.startedOnce.Do(func() { close(m.started) })
+	ready()
 	select {
 	case <-m.stop:
 	case <-ctx.Done():
@@ -238,9 +239,7 @@ func TestSupervisor_InsertionOrderRespected(t *testing.T) {
 	// and stop in reverse Add() order. Run this multiple times to catch any
 	// map-iteration non-determinism.
 	for range 20 {
-		sup := frame.NewSupervisor(
-			frame.WithStartProbeWindow(5 * time.Millisecond),
-		)
+		sup := frame.NewSupervisor()
 
 		first := newMock("first")
 		second := newMock("second")
@@ -314,9 +313,7 @@ func TestSupervisor_DuplicateComponentPanics(t *testing.T) {
 // ── Supervisor: start failure ─────────────────────────────────────────────────
 
 func TestSupervisor_StartFailure_NeverRestart(t *testing.T) {
-	sup := frame.NewSupervisor(
-		frame.WithStartProbeWindow(5 * time.Millisecond),
-	)
+	sup := frame.NewSupervisor()
 	mc := newMock("broken")
 	mc.shouldFail.Store(true)
 	sup.Add(mc, frame.WithRestartPolicy(frame.NeverRestart()))
@@ -337,9 +334,7 @@ func TestSupervisor_StartFailure_WithRetries(t *testing.T) {
 	// Probe window = 5ms, retry delay = 10ms → each failed attempt costs ~15ms.
 	// We allow 20 retries (300ms budget) and disable failures after 100ms,
 	// which gives ~6 failed attempts before recovery with plenty of room left.
-	sup := frame.NewSupervisor(
-		frame.WithStartProbeWindow(5 * time.Millisecond),
-	)
+	sup := frame.NewSupervisor()
 	mc := newMock("flaky")
 	mc.shouldFail.Store(true)
 
@@ -615,7 +610,7 @@ func TestServiceAdapter_LifecycleIntegration(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startDone := make(chan error, 1)
-	go func() { startDone <- adapter.Start(ctx) }()
+	go func() { startDone <- adapter.Start(ctx, func() {}) }()
 
 	time.Sleep(20 * time.Millisecond)
 	if !legacy.initCalled.Load() {
@@ -651,7 +646,7 @@ func TestServiceAdapter_InitError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	err := adapter.Start(ctx)
+	err := adapter.Start(ctx, func() {})
 	if !errors.Is(err, errFake) {
 		t.Fatalf("expected errFake, got: %v", err)
 	}
@@ -740,43 +735,34 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	}
 }
 
-// ── Starter interface ─────────────────────────────────────────────────────────
+// ── ready() function — precise readiness signalling ──────────────────────────
 
-// starterMock is a Component that implements Starter for precise readiness
-// signalling. It closes its readyCh after a configurable delay inside Start,
-// simulating a server that needs a moment to bind a port.
-type starterMock struct {
+// delayedReadyComponent calls ready() after a configurable delay, simulating
+// a server that needs time to bind a port before it can serve traffic.
+type delayedReadyComponent struct {
 	mockComponent
-	readyCh    chan struct{}
 	readyDelay time.Duration
 }
 
-func newStarterMock(name string, readyDelay time.Duration) *starterMock {
-	m := &starterMock{
+func newDelayedReady(name string, delay time.Duration) *delayedReadyComponent {
+	return &delayedReadyComponent{
 		mockComponent: *newMock(name),
-		readyCh:       make(chan struct{}),
-		readyDelay:    readyDelay,
+		readyDelay:    delay,
 	}
-	return m
 }
 
-func (m *starterMock) Started() <-chan struct{} { return m.readyCh }
-
-func (m *starterMock) Start(ctx context.Context) error {
+func (m *delayedReadyComponent) Start(ctx context.Context, ready func()) error {
 	m.startCalled.Add(1)
 	if m.shouldFail.Load() {
 		return errFake
 	}
-	// Signal started channel (for waitStarted helper).
 	m.startedOnce.Do(func() { close(m.started) })
-	// Delay before signalling ready, simulating port bind time.
 	select {
 	case <-time.After(m.readyDelay):
-		close(m.readyCh)
+		ready()
 	case <-ctx.Done():
 		return nil
 	}
-	// Block for component lifetime.
 	select {
 	case <-m.stop:
 	case <-ctx.Done():
@@ -784,15 +770,12 @@ func (m *starterMock) Start(ctx context.Context) error {
 	return nil
 }
 
-func TestStarter_PreciseReadiness(t *testing.T) {
-	// A Starter component should signal readiness without waiting for the
-	// probe window. With a 5ms ready delay and a 2s probe window, the
-	// supervisor should proceed in ~5ms, not ~2s.
-	sup := frame.NewSupervisor(
-		frame.WithStartProbeWindow(2 * time.Second), // deliberately long
-	)
+func TestReady_PreciseReadiness(t *testing.T) {
+	// Component calls ready() after 5ms. The supervisor should proceed to the
+	// next component in ~5ms, well within the 15s startTimeout.
+	sup := frame.NewSupervisor()
 
-	sm := newStarterMock("precise", 5*time.Millisecond)
+	sm := newDelayedReady("precise", 5*time.Millisecond)
 	sup.Add(sm)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -804,9 +787,8 @@ func TestStarter_PreciseReadiness(t *testing.T) {
 	waitStarted(t, &sm.mockComponent, 3*time.Second)
 	elapsed := time.Since(start)
 
-	// Should be ready well under 200ms, not waiting the full 2s probe window.
 	if elapsed > 500*time.Millisecond {
-		t.Errorf("Starter component took %v to become ready; expected <500ms", elapsed)
+		t.Errorf("component took %v to become ready; expected <500ms", elapsed)
 	}
 
 	cancel()
@@ -820,14 +802,12 @@ func TestStarter_PreciseReadiness(t *testing.T) {
 	}
 }
 
-func TestStarter_DependentWaitsForReady(t *testing.T) {
-	// dep implements Starter with a deliberate 50ms delay.
-	// svc depends on dep — it must not start until dep signals ready.
-	sup := frame.NewSupervisor(
-		frame.WithStartProbeWindow(5 * time.Millisecond),
-	)
+func TestReady_DependentWaitsForReady(t *testing.T) {
+	// dep delays ready() by 50ms. svc depends on dep — svc must not start
+	// until dep has called ready().
+	sup := frame.NewSupervisor()
 
-	dep := newStarterMock("dep", 50*time.Millisecond)
+	dep := newDelayedReady("dep", 50*time.Millisecond)
 	svc := newMock("svc")
 	sup.Add(dep)
 	sup.Add(svc, frame.WithDependencies("dep"))
@@ -836,14 +816,12 @@ func TestStarter_DependentWaitsForReady(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sup.Run(ctx) }()
 
-	// dep must start first, then svc.
 	waitStarted(t, &dep.mockComponent, 2*time.Second)
 	depReadyAt := time.Now()
 
 	waitStarted(t, svc, 2*time.Second)
 	svcStartedAt := time.Now()
 
-	// svc must have started after dep was ready (50ms delay).
 	if svcStartedAt.Before(depReadyAt) {
 		t.Error("svc started before dep was ready")
 	}
@@ -902,7 +880,6 @@ func TestMetricsObserver_StartStop(t *testing.T) {
 	obs := &captureMetrics{}
 	sup := frame.NewSupervisor(
 		frame.WithMetricsObserver(obs),
-		frame.WithStartProbeWindow(5*time.Millisecond),
 	)
 	mc := newMock("svc")
 	sup.Add(mc)
@@ -929,7 +906,6 @@ func TestMetricsObserver_HealthChecks(t *testing.T) {
 		frame.WithMetricsObserver(obs),
 		frame.WithHealthInterval(20*time.Millisecond),
 		frame.WithHealthTimeout(10*time.Millisecond),
-		frame.WithStartProbeWindow(5*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc)
@@ -959,7 +935,6 @@ func TestMetricsObserver_Restarts(t *testing.T) {
 	obs := &captureMetrics{}
 	sup := frame.NewSupervisor(
 		frame.WithMetricsObserver(obs),
-		frame.WithStartProbeWindow(5*time.Millisecond),
 	)
 	mc := newMock("svc")
 	mc.shouldFail.Store(true)
@@ -994,7 +969,6 @@ func TestContextCause_CriticalFailure(t *testing.T) {
 	sup := frame.NewSupervisor(
 		frame.WithHealthInterval(20*time.Millisecond),
 		frame.WithHealthTimeout(10*time.Millisecond),
-		frame.WithStartProbeWindow(5*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc,
@@ -1028,9 +1002,7 @@ func TestContextCause_CriticalFailure(t *testing.T) {
 
 func TestHealthReporter_Interface(t *testing.T) {
 	// *Supervisor must satisfy HealthReporter.
-	sup := frame.NewSupervisor(
-		frame.WithStartProbeWindow(5 * time.Millisecond),
-	)
+	sup := frame.NewSupervisor()
 	mc := newMock("svc")
 	sup.Add(mc)
 
@@ -1067,9 +1039,7 @@ func TestServiceAdapter_SafeAfterRestart(t *testing.T) {
 	svc.setInitErr(errFake) // first attempt will fail
 
 	adapter := frame.NewServiceAdapter(svc)
-	sup := frame.NewSupervisor(
-		frame.WithStartProbeWindow(5 * time.Millisecond),
-	)
+	sup := frame.NewSupervisor()
 	sup.Add(adapter, frame.WithRestartPolicy(frame.MaxRetries(5, 10*time.Millisecond)))
 
 	// After 30 ms clear the error so the next retry succeeds.
@@ -1108,16 +1078,14 @@ func TestServiceAdapter_SafeAfterRestart(t *testing.T) {
 	}
 }
 
-// ── startTimeout applied to Starter components (#4) ──────────────────────────
+// ── startTimeout: component never calls ready() ───────────────────────────────
 
-func TestStarter_StartTimeoutEnforced(t *testing.T) {
-	// A Starter that never closes its readyCh should be failed by the
-	// startTimeout, not block forever.
+func TestStartTimeout_NeverCallsReady(t *testing.T) {
+	// A component that never calls ready() should be failed by startTimeout.
 	sup := frame.NewSupervisor(
 		frame.WithStartTimeout(50 * time.Millisecond),
 	)
 
-	// A component that implements Starter but never signals ready.
 	hungSvc := &neverReadyComponent{stop: make(chan struct{})}
 	sup.Add(hungSvc, frame.WithRestartPolicy(frame.NeverRestart()))
 
@@ -1126,23 +1094,17 @@ func TestStarter_StartTimeoutEnforced(t *testing.T) {
 
 	err := sup.Run(ctx)
 	if err == nil {
-		t.Fatal("expected error from component that never signals ready")
+		t.Fatal("expected error from component that never calls ready()")
 	}
 }
 
 type neverReadyComponent struct {
-	stop    chan struct{}
-	readyCh chan struct{} // never closed
+	stop chan struct{}
 }
 
 func (c *neverReadyComponent) Name() string { return "never-ready" }
-func (c *neverReadyComponent) Started() <-chan struct{} {
-	if c.readyCh == nil {
-		c.readyCh = make(chan struct{})
-	}
-	return c.readyCh
-}
-func (c *neverReadyComponent) Start(ctx context.Context) error {
+func (c *neverReadyComponent) Start(ctx context.Context, _ func()) error {
+	// Never calls ready() — supervisor must time out.
 	select {
 	case <-c.stop:
 	case <-ctx.Done():
@@ -1196,9 +1158,7 @@ func TestApplication_ShutdownWithCause(t *testing.T) {
 // ── HealthReportOrdered determinism (#5) ─────────────────────────────────────
 
 func TestHealthReportOrdered_Deterministic(t *testing.T) {
-	sup := frame.NewSupervisor(
-		frame.WithStartProbeWindow(5 * time.Millisecond),
-	)
+	sup := frame.NewSupervisor()
 	z := newMock("zebra")
 	a := newMock("alpha")
 	m := newMock("mango")

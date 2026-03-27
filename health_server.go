@@ -10,14 +10,12 @@ import (
 )
 
 const (
-	statusOK      = "ok"
+	statusOK       = "ok"
 	statusDegraded = "degraded"
 )
 
 // HealthReporter is the interface the HealthServer uses to query component
-// health. *Supervisor satisfies this interface via both HealthReport() and
-// HealthReportOrdered(). You can also implement it yourself for testing or
-// custom aggregation.
+// health. *Supervisor satisfies this via HealthReportOrdered().
 type HealthReporter interface {
 	HealthReportOrdered() []NamedComponentStatus
 }
@@ -51,26 +49,22 @@ func WithHealthLogger(l Logger) HealthServerOption {
 // HealthServer is a Component that exposes three HTTP endpoints:
 //
 //	GET /livez   — liveness:  200 while the process is alive
-//	GET /readyz  — readiness: 200 if all Critical/Significant components are healthy
+//	GET /readyz  — readiness: 200 if all Critical/Significant components healthy
 //	GET /healthz — alias for /readyz (Docker HEALTHCHECK compatibility)
 //
-// Register HealthServer first with the Supervisor so it starts before all
-// other components (serving /livez 200 and /readyz 503 during startup) and
-// stops last (keeping the orchestrator informed during shutdown).
+// Register HealthServer first with the Supervisor so it starts before
+// everything else and stops last.
 type HealthServer struct {
 	reporter HealthReporter
 	addr     string
 	server   *http.Server
 	logger   Logger
-	readyCh  chan struct{} // closed when the TCP listener is bound
 
 	mu    sync.RWMutex
 	alive bool
 }
 
-// NewHealthServer creates a HealthServer that uses reporter to aggregate
-// component health for /readyz. Pass a *Supervisor directly — it satisfies
-// HealthReporter via its HealthReport() method.
+// NewHealthServer creates a HealthServer. Pass a *Supervisor as the reporter.
 func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *HealthServer {
 	cfg := healthServerConfig{
 		addr:         defaultHealthAddr,
@@ -83,19 +77,15 @@ func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *Healt
 			o(&cfg)
 		}
 	}
-
 	hs := &HealthServer{
 		reporter: reporter,
 		addr:     cfg.addr,
 		logger:   cfg.logger,
-		readyCh:  make(chan struct{}),
 	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", hs.handleLivez)
 	mux.HandleFunc("/readyz", hs.handleReadyz)
 	mux.HandleFunc("/healthz", hs.handleReadyz)
-
 	hs.server = &http.Server{
 		Addr:         cfg.addr,
 		Handler:      mux,
@@ -107,13 +97,9 @@ func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *Healt
 
 func (h *HealthServer) Name() string { return "health-server" }
 
-// Started implements Starter. The channel is closed the moment the TCP
-// listener is bound — before Serve blocks — giving the supervisor a precise
-// readiness signal rather than relying on the probe-window heuristic.
-func (h *HealthServer) Started() <-chan struct{} { return h.readyCh }
-
-// Start begins listening and serving. It blocks until the server is shut down.
-func (h *HealthServer) Start(_ context.Context) error {
+// Start implements Component. It binds the TCP port, calls ready() to signal
+// the supervisor, then serves until Stop is called.
+func (h *HealthServer) Start(_ context.Context, ready func()) error {
 	h.logger.Info("health server starting", "addr", h.addr)
 
 	ln, err := net.Listen("tcp", h.addr)
@@ -126,7 +112,7 @@ func (h *HealthServer) Start(_ context.Context) error {
 	h.mu.Unlock()
 
 	h.logger.Info("health server listening", "addr", h.addr)
-	close(h.readyCh) // signal supervisor: TCP port is bound, ready to serve
+	ready() // TCP port is bound — supervisor proceeds to next component
 
 	if err := h.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
@@ -134,7 +120,6 @@ func (h *HealthServer) Start(_ context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the HTTP server within the context deadline.
 func (h *HealthServer) Stop(ctx context.Context) error {
 	h.mu.Lock()
 	h.alive = false
@@ -147,7 +132,6 @@ func (h *HealthServer) handleLivez(w http.ResponseWriter, _ *http.Request) {
 	h.mu.RLock()
 	alive := h.alive
 	h.mu.RUnlock()
-
 	w.Header().Set("Content-Type", "application/json")
 	if alive {
 		w.WriteHeader(http.StatusOK)
@@ -174,16 +158,11 @@ func (h *HealthServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 		h.handleLivez(w, nil)
 		return
 	}
-
-	// HealthReportOrdered returns components sorted by name, so the JSON
-	// response is always deterministic regardless of map iteration order.
 	report := h.reporter.HealthReportOrdered()
 	allHealthy := true
 	details := make([]componentHealthDetail, 0, len(report))
-
 	for _, status := range report {
 		detail := componentHealthDetail{Name: status.Name, Status: statusOK}
-
 		if status.Known && status.Err != nil {
 			detail.Status = statusDegraded
 			detail.Error = status.Err.Error()
@@ -191,22 +170,18 @@ func (h *HealthServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 				allHealthy = false
 			}
 		}
-
 		details = append(details, detail)
 	}
-
 	resp := readyzResponse{Components: details}
 	if allHealthy {
 		resp.Status = statusOK
 	} else {
 		resp.Status = statusDegraded
 	}
-
 	code := http.StatusOK
 	if !allHealthy {
 		code = http.StatusServiceUnavailable
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(resp)
