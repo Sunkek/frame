@@ -7,8 +7,9 @@ type appError string
 func (e appError) Error() string { return string(e) }
 
 const (
-	// ErrMainOmitted is returned by Application.Run when no MainFunc was provided.
-	ErrMainOmitted appError = "frame: main function is omitted"
+	// ErrNothingToRun is returned by Application.Run when neither a MainFunc
+	// nor a Supervisor was provided.
+	ErrNothingToRun appError = "frame: nothing to run (no main function or supervisor provided)"
 
 	// ErrShutdownTimeout is returned when the application does not stop within
 	// the configured ShutdownTimeout after the context is cancelled.

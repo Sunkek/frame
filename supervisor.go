@@ -10,7 +10,10 @@ import (
 )
 
 // healthStatus holds the last observed health state of a component.
+// tier is set once at Run() time before any goroutine can read it and is
+// never mutated again, so it is safe to read without the mu.
 type healthStatus struct {
+	tier    Tier
 	mu      sync.RWMutex
 	err     error
 	present bool
@@ -181,8 +184,7 @@ func (s *Supervisor) HealthReport() map[string]ComponentStatus {
 	out := make(map[string]ComponentStatus, len(statuses))
 	for name, hs := range statuses {
 		err, known := hs.get()
-		mc := s.components[name]
-		out[name] = ComponentStatus{Err: err, Known: known, Tier: mc.tier}
+		out[name] = ComponentStatus{Err: err, Known: known, Tier: hs.tier}
 	}
 	return out
 }
@@ -198,10 +200,9 @@ func (s *Supervisor) HealthReportOrdered() []NamedComponentStatus {
 	out := make([]NamedComponentStatus, 0, len(statuses))
 	for name, hs := range statuses {
 		err, known := hs.get()
-		mc := s.components[name]
 		out = append(out, NamedComponentStatus{
 			Name:            name,
-			ComponentStatus: ComponentStatus{Err: err, Known: known, Tier: mc.tier},
+			ComponentStatus: ComponentStatus{Err: err, Known: known, Tier: hs.tier},
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -235,7 +236,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.statusMu.Lock()
 	s.statuses = make(map[string]*healthStatus, len(ordered))
 	for _, mc := range ordered {
-		s.statuses[mc.component.Name()] = &healthStatus{}
+		s.statuses[mc.component.Name()] = &healthStatus{tier: mc.tier}
 	}
 	s.statusMu.Unlock()
 
@@ -366,7 +367,10 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 			startErr = err
 		case <-ctx.Done():
 			timer.Stop()
-			// Drain the goroutine before returning.
+			// The outer stopAll will call Stop on this component. Calling it
+			// here too would be a double-Stop and may leave the Start goroutine
+			// permanently blocked if the component's Stop is not idempotent.
+			// Just drain the goroutine so wg never stalls.
 			<-startExit
 			return nil
 		case <-timer.C:
@@ -395,7 +399,6 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 
 		select {
 		case <-ctx.Done():
-			<-startExit
 			return nil
 		case <-time.After(delay):
 		}

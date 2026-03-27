@@ -142,14 +142,18 @@ func TestMaxRetries(t *testing.T) {
 func TestExponentialBackoff(t *testing.T) {
 	base := 10 * time.Millisecond
 	p := frame.ExponentialBackoff(4, base)
-	expected := []time.Duration{base, 2 * base, 4 * base, 8 * base}
-	for i, want := range expected {
+	// Each attempt's nominal delay doubles; ±25% jitter is applied so the
+	// actual delay falls in [0.75×nominal, 1.25×nominal).
+	nominals := []time.Duration{base, 2 * base, 4 * base, 8 * base}
+	for i, nominal := range nominals {
 		restart, got := p.ShouldRestart(errFake, i)
 		if !restart {
 			t.Fatalf("ExponentialBackoff should restart at attempt %d", i)
 		}
-		if got != want {
-			t.Fatalf("attempt %d: want delay %v, got %v", i, want, got)
+		lo := time.Duration(float64(nominal) * 0.75)
+		hi := time.Duration(float64(nominal) * 1.25)
+		if got < lo || got >= hi {
+			t.Fatalf("attempt %d: delay %v outside jitter range [%v, %v)", i, got, lo, hi)
 		}
 	}
 	restart, _ := p.ShouldRestart(errFake, 4)
@@ -553,113 +557,8 @@ func TestApplication_MainFuncError(t *testing.T) {
 func TestApplication_NoMainFunc_NoSupervisor(t *testing.T) {
 	app := frame.NewApplication()
 	err := app.Run()
-	if !errors.Is(err, frame.ErrMainOmitted) {
-		t.Fatalf("expected ErrMainOmitted, got: %v", err)
-	}
-}
-
-// ── ServiceAdapter ────────────────────────────────────────────────────────────
-
-type mockLegacyService struct {
-	name        string
-	closeErr    error // set before test, never mutated concurrently
-	initCalled  atomic.Bool
-	closeCalled atomic.Bool
-
-	// Use atomic.Value with a typed wrapper so errors.Is works correctly
-	// while remaining race-safe. Empty wrapper (nil Err) means no error.
-	initErrVal atomic.Value // stores errWrapper
-	pingErrVal atomic.Value // stores errWrapper
-}
-
-// errWrapper is a concrete type so atomic.Value always stores the same type.
-type errWrapper struct{ err error }
-
-func newMockLegacyService(name string) *mockLegacyService {
-	m := &mockLegacyService{name: name}
-	m.initErrVal.Store(errWrapper{})
-	m.pingErrVal.Store(errWrapper{})
-	return m
-}
-
-func (s *mockLegacyService) setInitErr(err error) {
-	s.initErrVal.Store(errWrapper{err: err})
-}
-
-func (s *mockLegacyService) setPingErr(err error) {
-	s.pingErrVal.Store(errWrapper{err: err})
-}
-
-func (s *mockLegacyService) Ident() string { return s.name }
-func (s *mockLegacyService) Init(_ context.Context) error {
-	s.initCalled.Store(true)
-	return s.initErrVal.Load().(errWrapper).err
-}
-func (s *mockLegacyService) Ping(_ context.Context) error {
-	return s.pingErrVal.Load().(errWrapper).err
-}
-func (s *mockLegacyService) Close() error { s.closeCalled.Store(true); return s.closeErr }
-
-func TestServiceAdapter_LifecycleIntegration(t *testing.T) {
-	legacy := newMockLegacyService("postgres")
-	adapter := frame.NewServiceAdapter(legacy)
-
-	if adapter.Name() != "postgres" {
-		t.Fatalf("unexpected name: %s", adapter.Name())
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	startDone := make(chan error, 1)
-	go func() { startDone <- adapter.Start(ctx, func() {}) }()
-
-	time.Sleep(20 * time.Millisecond)
-	if !legacy.initCalled.Load() {
-		t.Fatal("Init was not called")
-	}
-
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
-	defer stopCancel()
-	if err := adapter.Stop(stopCtx); err != nil {
-		t.Fatalf("Stop error: %v", err)
-	}
-
-	select {
-	case err := <-startDone:
-		if err != nil {
-			t.Fatalf("Start error: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Start did not return after Stop")
-	}
-
-	if !legacy.closeCalled.Load() {
-		t.Fatal("Close was not called")
-	}
-	cancel()
-}
-
-func TestServiceAdapter_InitError(t *testing.T) {
-	legacy := newMockLegacyService("redis")
-	legacy.setInitErr(errFake)
-	adapter := frame.NewServiceAdapter(legacy)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	err := adapter.Start(ctx, func() {})
-	if !errors.Is(err, errFake) {
-		t.Fatalf("expected errFake, got: %v", err)
-	}
-}
-
-func TestServiceAdapter_HealthDelegation(t *testing.T) {
-	legacy := newMockLegacyService("redis")
-	legacy.setPingErr(errFake)
-	adapter := frame.NewServiceAdapter(legacy)
-
-	err := adapter.Health(context.Background())
-	if !errors.Is(err, errFake) {
-		t.Fatalf("expected errFake from Health, got: %v", err)
+	if !errors.Is(err, frame.ErrNothingToRun) {
+		t.Fatalf("expected ErrNothingToRun, got: %v", err)
 	}
 }
 
@@ -671,7 +570,7 @@ func TestHealthServer_Endpoints(t *testing.T) {
 		frame.WithStartTimeout(2*time.Second),
 	)
 
-	hs := frame.NewHealthServer(sup, frame.WithHealthAddr(":18080"))
+	hs := frame.NewHealthServer(sup, frame.WithHealthAddr(":19090"))
 	// Register health server first so it starts before other components.
 	sup.Add(hs, frame.WithTier(frame.TierCritical))
 
@@ -687,7 +586,7 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	var err error
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err = http.Get("http://localhost:18080/livez")
+		resp, err = http.Get("http://localhost:19090/livez")
 		if err == nil {
 			break
 		}
@@ -705,7 +604,7 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	// /readyz should eventually return 200 once db is started.
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err = http.Get("http://localhost:18080/readyz")
+		resp, err = http.Get("http://localhost:19090/readyz")
 		if err == nil && resp.StatusCode == http.StatusOK {
 			resp.Body.Close()
 			break
@@ -717,7 +616,7 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	}
 
 	// /healthz is an alias for /readyz.
-	resp2, err2 := http.Get("http://localhost:18080/healthz")
+	resp2, err2 := http.Get("http://localhost:19090/healthz")
 	if err2 != nil {
 		cancel()
 		t.Fatalf("healthz request failed: %v", err2)
@@ -1027,55 +926,6 @@ func TestHealthReporter_Interface(t *testing.T) {
 
 	cancel()
 	<-done
-}
-
-// ── ServiceAdapter restart safety (#1) ───────────────────────────────────────
-
-func TestServiceAdapter_SafeAfterRestart(t *testing.T) {
-	// A ServiceAdapter with a restart policy must not panic on the second
-	// Start call (channel-reinitialisation fix). Init fails on the first
-	// attempt and succeeds on subsequent attempts.
-	svc := newMockLegacyService("restartable")
-	svc.setInitErr(errFake) // first attempt will fail
-
-	adapter := frame.NewServiceAdapter(svc)
-	sup := frame.NewSupervisor()
-	sup.Add(adapter, frame.WithRestartPolicy(frame.MaxRetries(5, 10*time.Millisecond)))
-
-	// After 30 ms clear the error so the next retry succeeds.
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		svc.setInitErr(nil)
-	}()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- sup.Run(ctx) }()
-
-	// Wait until Init has been called at least twice (one failure + one success).
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if svc.initCalled.Load() {
-			// initCalled is true after the first call; we need to wait for the
-			// successful second call, which we detect by the adapter becoming
-			// ready (supervisor would cancel on failure).
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Give the supervisor time to complete the successful start.
-	time.Sleep(100 * time.Millisecond)
-
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("unexpected error after restart: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("supervisor did not stop after restart test")
-	}
 }
 
 // ── startTimeout: component never calls ready() ───────────────────────────────

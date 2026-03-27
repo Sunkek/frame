@@ -14,7 +14,7 @@ const (
 	defaultRestartResetWindow = 5 * time.Minute
 
 	// HealthServer defaults.
-	defaultHealthAddr         = ":8080"
+	defaultHealthAddr         = ":9090"
 	defaultHealthReadTimeout  = 5 * time.Second
 	defaultHealthWriteTimeout = 5 * time.Second
 )

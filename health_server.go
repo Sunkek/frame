@@ -24,10 +24,19 @@ type HealthReporter interface {
 type HealthServerOption func(*healthServerConfig)
 
 type healthServerConfig struct {
+	name         string
 	addr         string
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 	logger       Logger
+}
+
+// WithHealthName overrides the component name returned by HealthServer.Name.
+// This is useful when registering multiple HealthServer instances (e.g. on
+// different ports) with the same Supervisor.
+// Defaults to "health-server".
+func WithHealthName(name string) HealthServerOption {
+	return func(c *healthServerConfig) { c.name = name }
 }
 
 func WithHealthAddr(addr string) HealthServerOption {
@@ -55,6 +64,7 @@ func WithHealthLogger(l Logger) HealthServerOption {
 // Register HealthServer first with the Supervisor so it starts before
 // everything else and stops last.
 type HealthServer struct {
+	name     string
 	reporter HealthReporter
 	addr     string
 	server   *http.Server
@@ -67,6 +77,7 @@ type HealthServer struct {
 // NewHealthServer creates a HealthServer. Pass a *Supervisor as the reporter.
 func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *HealthServer {
 	cfg := healthServerConfig{
+		name:         "health-server",
 		addr:         defaultHealthAddr,
 		readTimeout:  defaultHealthReadTimeout,
 		writeTimeout: defaultHealthWriteTimeout,
@@ -78,6 +89,7 @@ func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *Healt
 		}
 	}
 	hs := &HealthServer{
+		name:     cfg.name,
 		reporter: reporter,
 		addr:     cfg.addr,
 		logger:   cfg.logger,
@@ -95,7 +107,7 @@ func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *Healt
 	return hs
 }
 
-func (h *HealthServer) Name() string { return "health-server" }
+func (h *HealthServer) Name() string { return h.name }
 
 // Start implements Component. It binds the TCP port, calls ready() to signal
 // the supervisor, then serves until Stop is called.

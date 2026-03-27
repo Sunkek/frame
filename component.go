@@ -13,9 +13,10 @@ const (
 	// critical component causes the entire application to shut down.
 	TierCritical Tier = iota
 
-	// TierSignificant — a persistently unhealthy significant component marks
-	// the application as not-ready (/readyz returns 503) but does not trigger
-	// a shutdown. A permanent failure still shuts the app down.
+	// TierSignificant — while a significant component is transiently unhealthy
+	// the application is marked not-ready (/readyz returns 503) but keeps
+	// running. A permanent failure (restart policy exhausted) triggers a full
+	// shutdown, identical to TierCritical.
 	TierSignificant
 
 	// TierAuxiliary — health problems are logged and hooks are fired, but they

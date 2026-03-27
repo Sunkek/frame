@@ -129,7 +129,7 @@ func (a *Application) Shutdown(cause error) {
 // the returned error.
 func (a *Application) Run() error {
 	if a.main == nil && a.supervisor == nil {
-		return ErrMainOmitted
+		return ErrNothingToRun
 	}
 
 	sigCtx, stopSig := signal.NotifyContext(

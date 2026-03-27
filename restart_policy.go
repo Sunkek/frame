@@ -1,6 +1,9 @@
 package frame
 
-import "time"
+import (
+	"math/rand/v2"
+	"time"
+)
 
 // RestartPolicy decides whether a component should be restarted after a
 // failure and, if so, how long to wait before the next attempt.
@@ -51,7 +54,12 @@ func (p maxRetriesPolicy) ShouldRestart(_ error, attempt int) (bool, time.Durati
 
 // ExponentialBackoff returns a policy that restarts a component up to
 // maxRetries times. The delay doubles with each attempt starting from
-// baseDelay (baseDelay, 2×baseDelay, 4×baseDelay, …).
+// baseDelay, with ±25% jitter applied to spread restarts when many instances
+// fail simultaneously:
+//
+//	attempt 0: baseDelay  × [0.75, 1.25)
+//	attempt 1: 2×baseDelay × [0.75, 1.25)
+//	attempt 2: 4×baseDelay × [0.75, 1.25)  …and so on
 func ExponentialBackoff(maxRetries int, baseDelay time.Duration) RestartPolicy {
 	return exponentialBackoff{max: maxRetries, base: baseDelay}
 }
@@ -65,5 +73,7 @@ func (p exponentialBackoff) ShouldRestart(_ error, attempt int) (bool, time.Dura
 	if attempt >= p.max {
 		return false, 0
 	}
-	return true, p.base * (1 << attempt)
+	base := p.base * (1 << attempt)
+	jitter := time.Duration(float64(base) * (0.75 + rand.Float64()*0.5))
+	return true, jitter
 }
