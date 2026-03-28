@@ -182,6 +182,11 @@ func (a *Application) Run() error {
 	}
 
 	<-rootCtx.Done()
+	// Re-enable normal signal delivery immediately. Until stopSig is called,
+	// signal.NotifyContext intercepts every signal — so repeated Ctrl+C presses
+	// during shutdown are silently swallowed. Calling it here means the second
+	// signal kills the process instead of being ignored.
+	stopSig()
 	a.logger.Info("application shutting down")
 
 	done := make(chan struct{})

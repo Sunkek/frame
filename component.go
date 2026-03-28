@@ -51,6 +51,9 @@ func (t Tier) String() string {
 //
 // Stop is called with a context carrying the configured stop timeout.
 // Stop must not block longer than that context allows.
+// Stop must be safe to call concurrently with Start, before Start has made
+// any progress (e.g. before a port is bound), and more than once — the
+// supervisor guarantees at-least-once Stop calls in some shutdown paths.
 //
 // Example — an HTTP server:
 //

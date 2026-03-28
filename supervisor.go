@@ -46,6 +46,10 @@ type supervisorConfig struct {
 	metrics            MetricsObserver
 }
 
+// WithHealthInterval sets how often the supervisor polls component health.
+// Defaults to 10s.
+// WithHealthInterval sets how often the supervisor polls each component's
+// Health method. Defaults to 10s.
 func WithHealthInterval(d time.Duration) SupervisorOption {
 	return func(c *supervisorConfig) { c.healthInterval = d }
 }
@@ -260,9 +264,18 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			started = append(started, mc)
 
 		case <-ctx.Done():
-			started = append(started, mc)
+			// stopAll handles the components that finished starting successfully.
+			// The in-flight component is handled by startOne's ctx.Done branch,
+			// which calls doStop before draining the Start goroutine.
 			s.stopAll(started)
 			<-startErrCh
+			wg.Wait()
+			close(criticalErrCh)
+			for err := range criticalErrCh {
+				if err != nil {
+					return err
+				}
+			}
 			if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
 				return cause
 			}
@@ -367,10 +380,10 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 			startErr = err
 		case <-ctx.Done():
 			timer.Stop()
-			// The outer stopAll will call Stop on this component. Calling it
-			// here too would be a double-Stop and may leave the Start goroutine
-			// permanently blocked if the component's Stop is not idempotent.
-			// Just drain the goroutine so wg never stalls.
+			// Stop the component so its Start goroutine unblocks and returns,
+			// then drain startExit. This is safe to call even when the startup
+			// loop's stopAll has already run — Stop must be idempotent.
+			s.doStop(mc)
 			<-startExit
 			return nil
 		case <-timer.C:
@@ -406,6 +419,10 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 }
 
 // manage runs the ongoing health-check loop for a running component.
+// It accesses s.statuses[name] directly (without statusMu) because the map
+// is written exactly once in Run() before any goroutine starts, and is never
+// structurally modified afterwards. Only the per-entry healthStatus values are
+// mutated, each under their own mu.
 func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel context.CancelCauseFunc) error {
 	name := mc.component.Name()
 
