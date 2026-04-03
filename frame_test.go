@@ -788,7 +788,23 @@ func TestMetricsObserver_StartStop(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sup.Run(ctx) }()
 
-	waitStarted(t, mc, 2*time.Second)
+	// Wait for ComponentStarted to fire — this is the definitive signal that
+	// the supervisor has fully processed the component's readiness, which
+	// happens after ready() is called inside Start. Waiting on mc.started
+	// is not sufficient because that channel closes inside the Start goroutine,
+	// which races with startOne processing readySignal and emitting the metric.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if obs.startedCount() >= 1 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if obs.startedCount() < 1 {
+		cancel()
+		t.Fatal("ComponentStarted was not called within 2s")
+	}
+
 	cancel()
 	<-done
 
@@ -1327,4 +1343,51 @@ func TestApplication_SupervisorFailure_PropagatesError(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("application did not exit after critical component failure")
 	}
+}
+
+// ── RestartCount ──────────────────────────────────────────────────────────────
+
+func TestComponentStatus_RestartCountIncrements(t *testing.T) {
+	// Each health-triggered restart must increment RestartCount in the
+	// status report so operators can detect flapping components.
+	sup := frame.NewSupervisor(
+		frame.WithHealthInterval(20*time.Millisecond),
+		frame.WithHealthTimeout(10*time.Millisecond),
+	)
+	mc := newMock("db")
+	sup.Add(mc,
+		frame.WithTier(frame.TierCritical),
+		frame.WithRestartPolicy(frame.MaxRetries(5, 5*time.Millisecond)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 2*time.Second)
+
+	// Trigger a health-driven restart.
+	mc.setHealthErr(errFake)
+
+	// Wait until at least one restart has been recorded.
+	deadline := time.Now().Add(2 * time.Second)
+	var restartCount int
+	for time.Now().Before(deadline) {
+		for _, s := range sup.HealthReportOrdered() {
+			if s.Name == "db" {
+				restartCount = s.RestartCount
+			}
+		}
+		if restartCount > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if restartCount == 0 {
+		t.Error("RestartCount should be > 0 after a health-triggered restart")
+	}
+
+	mc.setHealthErr(nil)
+	cancel()
+	<-done
 }

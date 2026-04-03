@@ -155,9 +155,10 @@ func (h *HealthServer) handleLivez(w http.ResponseWriter, _ *http.Request) {
 }
 
 type componentHealthDetail struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	Error        string `json:"error,omitempty"`
+	RestartCount int    `json:"restart_count,omitempty"`
 }
 
 type readyzResponse struct {
@@ -174,7 +175,7 @@ func (h *HealthServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	allHealthy := true
 	details := make([]componentHealthDetail, 0, len(report))
 	for _, status := range report {
-		detail := componentHealthDetail{Name: status.Name, Status: statusOK}
+		detail := componentHealthDetail{Name: status.Name, Status: statusOK, RestartCount: status.RestartCount}
 		if status.Known && status.Err != nil {
 			detail.Status = statusDegraded
 			detail.Error = status.Err.Error()

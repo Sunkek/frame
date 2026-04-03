@@ -1,3 +1,3 @@
 module github.com/sunkek/frame
 
-go 1.25.5
+go 1.22.2

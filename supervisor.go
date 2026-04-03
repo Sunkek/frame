@@ -13,10 +13,11 @@ import (
 // tier is set once at Run() time before any goroutine can read it and is
 // never mutated again, so it is safe to read without the mu.
 type healthStatus struct {
-	tier    Tier
-	mu      sync.RWMutex
-	err     error
-	present bool
+	tier         Tier
+	mu           sync.RWMutex
+	err          error
+	present      bool
+	restartCount int
 }
 
 func (h *healthStatus) set(err error) {
@@ -26,10 +27,16 @@ func (h *healthStatus) set(err error) {
 	h.mu.Unlock()
 }
 
-func (h *healthStatus) get() (err error, present bool) {
+func (h *healthStatus) incRestarts() {
+	h.mu.Lock()
+	h.restartCount++
+	h.mu.Unlock()
+}
+
+func (h *healthStatus) get() (err error, present bool, restartCount int) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.err, h.present
+	return h.err, h.present, h.restartCount
 }
 
 // SupervisorOption configures a Supervisor.
@@ -172,7 +179,8 @@ func (s *Supervisor) ComponentHealth(name string) (err error, known bool) {
 	if !ok {
 		return nil, false
 	}
-	return hs.get()
+	err, known, _ = hs.get()
+	return
 }
 
 // HealthReport returns a snapshot of all component health states keyed by name.
@@ -185,8 +193,8 @@ func (s *Supervisor) HealthReport() map[string]ComponentStatus {
 	}
 	out := make(map[string]ComponentStatus, len(statuses))
 	for name, hs := range statuses {
-		err, known := hs.get()
-		out[name] = ComponentStatus{Err: err, Known: known, Tier: hs.tier}
+		err, known, restarts := hs.get()
+		out[name] = ComponentStatus{Err: err, Known: known, Tier: hs.tier, RestartCount: restarts}
 	}
 	return out
 }
@@ -201,10 +209,10 @@ func (s *Supervisor) HealthReportOrdered() []NamedComponentStatus {
 	}
 	out := make([]NamedComponentStatus, 0, len(statuses))
 	for name, hs := range statuses {
-		err, known := hs.get()
+		err, known, restarts := hs.get()
 		out = append(out, NamedComponentStatus{
 			Name:            name,
-			ComponentStatus: ComponentStatus{Err: err, Known: known, Tier: hs.tier},
+			ComponentStatus: ComponentStatus{Err: err, Known: known, Tier: hs.tier, RestartCount: restarts},
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -219,9 +227,10 @@ type NamedComponentStatus struct {
 
 // ComponentStatus is a point-in-time snapshot of a single component's health.
 type ComponentStatus struct {
-	Err   error
-	Known bool
-	Tier  Tier
+	Err          error // nil means healthy; non-nil means last health check failed
+	Known        bool  // false until the first health check completes
+	Tier         Tier
+	RestartCount int // number of times the component has been restarted by the supervisor
 }
 
 // Run starts all registered components in dependency order, monitors them, and
@@ -416,6 +425,9 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 		s.metrics.ComponentRestarting(name, startErr, attempt+1, delay)
 		s.logger.Info("component will restart",
 			"component", name, "delay", delay, "next_attempt", attempt+1)
+		if hs, ok := s.statuses[name]; ok {
+			hs.incRestarts()
+		}
 
 		select {
 		case <-ctx.Done():
@@ -494,6 +506,7 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 			s.metrics.ComponentRestarting(name, hErr, attempt+1, delay)
 			s.logger.Info("component restarting after unhealthy",
 				"component", name, "delay", delay, "next_attempt", attempt+1)
+			s.statuses[name].incRestarts()
 
 			select {
 			case <-ctx.Done():

@@ -1,8 +1,8 @@
 # frame
 
-A production-grade application lifecycle framework for Go services — zero external dependencies.
+A small, explicit lifecycle runtime for Go services — zero external dependencies.
 
-`frame` manages the startup, health monitoring, graceful shutdown, and orchestrator integration of your service's infrastructure components (HTTP servers, database pools, message brokers, caches, etc.).
+`frame` coordinates the startup, health monitoring, graceful shutdown, and orchestrator integration of your service's infrastructure components. It handles the questions every production service eventually faces: what order do dependencies start? what happens when Redis dies at 3am? when should the pod stop receiving traffic?
 
 ```sh
 go get github.com/sunkek/frame
@@ -22,40 +22,40 @@ type Component interface {
 }
 ```
 
-`Start` must **block** for the component's entire lifetime. Call `ready()` exactly once when the component is prepared to serve traffic — the supervisor will not start the next component until `ready()` is called. Return `nil` on clean shutdown and a non-nil error on unexpected failure.
+`Start` blocks for the component's entire lifetime. Call `ready()` exactly once when the component can serve traffic. `Stop` unblocks `Start` and cleans up.
 
-```go
-type PostgresPool struct {
-    pool *pgxpool.Pool
-    stop chan struct{}
-}
+---
 
-func (p *PostgresPool) Name() string { return "postgres" }
+## Lifecycle contract
 
-func (p *PostgresPool) Start(ctx context.Context, ready func()) error {
-    p.stop = make(chan struct{})
-    pool, err := pgxpool.New(ctx, dsn)
-    if err != nil {
-        return err
-    }
-    if err := pool.Ping(ctx); err != nil {
-        return err
-    }
-    p.pool = pool
-    ready() // pool is up — supervisor proceeds to the next component
-    select {
-    case <-p.stop:
-    case <-ctx.Done():
-    }
-    return nil
-}
+This section is the authoritative specification. Read it before implementing a component.
 
-func (p *PostgresPool) Stop(ctx context.Context) error {
-    close(p.stop)
-    p.pool.Close()
-    return nil
-}
-```
+### `Start(ctx, ready)`
+
+- **Must block** until the component exits — do not return early while the component is still serving.
+- Call `ready()` **exactly once**, only when the component is actually able to serve its intended function — not before a connection is verified, not before a port is bound.
+- `ready()` is safe to call multiple times (idempotent internally), but should only be called once semantically.
+- If `ctx` is cancelled (clean shutdown), return `nil`.
+- Return a **non-nil error only on abnormal failure** — not on clean context cancellation.
+- If `ready()` is never called, the supervisor waits up to `startTimeout` (default 15s) and treats the attempt as a failure.
+
+### `Stop(ctx)`
+
+- Must unblock `Start` and release resources within the context deadline (`stopTimeout`, default 10s).
+- Must be **idempotent** — the supervisor may call `Stop` more than once in some shutdown paths.
+- Must be **concurrency-safe** — `Stop` may be called concurrently with a still-initialising `Start` (e.g. before a port is bound). Guard shared state accordingly.
+
+### Background goroutines
+
+If `Start` spawns background goroutines, they must exit when `ctx` is cancelled or `Stop` is called. The supervisor has no way to detect or reap leaked goroutines. A leaked goroutine from a restarted component will accumulate across restart cycles.
+
+### Cancellation semantics
+
+| Event | `Start` should return | `Stop` is called |
+|---|---|---|
+| Clean shutdown (signal / `Shutdown()`) | `nil` | Yes |
+| Component failure | non-nil error | No (already exited) |
+| Restart due to health failure | `nil` (Stop unblocks it) | Yes, before restart |
 
 ---
 
@@ -76,7 +76,7 @@ func main() {
 }
 ```
 
-`ctx` is cancelled automatically on `SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGQUIT`.
+`ctx` is cancelled automatically on `SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGQUIT`. A clean signal shutdown returns `nil` — exit code 0.
 
 ---
 
@@ -92,7 +92,6 @@ func main() {
         frame.WithEventHooks(&frame.EventHooks{
             OnUnhealthy: func(component string, err error) {
                 logger.Error("component unhealthy", "component", component, "error", err)
-                // fire a PagerDuty/Slack alert here
             },
             OnRecovered: func(component string) {
                 logger.Info("component recovered", "component", component)
@@ -108,7 +107,6 @@ func main() {
     hs := frame.NewHealthServer(sup, frame.WithHealthAddr(":8080"))
     sup.Add(hs)
 
-    // Infrastructure — critical dependencies.
     sup.Add(postgres.New(cfg.Postgres),
         frame.WithTier(frame.TierCritical),
         frame.WithRestartPolicy(frame.ExponentialBackoff(5, time.Second)),
@@ -117,15 +115,11 @@ func main() {
         frame.WithTier(frame.TierCritical),
         frame.WithRestartPolicy(frame.ExponentialBackoff(5, time.Second)),
     )
-
-    // S3 is useful but not required for core functionality.
     sup.Add(s3.New(cfg.S3),
         frame.WithTier(frame.TierSignificant),
         frame.WithRestartPolicy(frame.AlwaysRestart(5*time.Second)),
     )
-
-    // HTTP server depends on postgres and redis — starts only after both
-    // are healthy, ensuring no requests arrive before dependencies are ready.
+    // HTTP server starts only after postgres and redis are ready.
     sup.Add(httpserver.New(cfg.HTTP),
         frame.WithTier(frame.TierCritical),
         frame.WithRestartPolicy(frame.MaxRetries(3, 2*time.Second)),
@@ -137,7 +131,6 @@ func main() {
         frame.WithLogger(logger),
         frame.WithShutdownTimeout(30*time.Second),
     )
-
     if err := app.Run(); err != nil {
         logger.Error("application exited with error", "error", err)
         os.Exit(1)
@@ -149,7 +142,7 @@ func main() {
 
 ## Component tiers
 
-Tiers control how a component's health affects the rest of the application.
+Tiers define how a component's health affects the rest of the application.
 
 | Tier | Transient unhealthy | Permanent failure |
 |---|---|---|
@@ -157,22 +150,53 @@ Tiers control how a component's health affects the rest of the application.
 | `TierSignificant` | `/readyz` → 503, app stays up | App shuts down |
 | `TierAuxiliary` | Logged only, no effect | Component removed, app continues |
 
-**Use `TierSignificant`** for components that degrade — but don't break — your service (e.g. a cache, a metrics sink, a secondary read replica). The app keeps running and the load balancer is informed via `/readyz`.
+**Use `TierSignificant`** for components that degrade — but don't break — your service (e.g. a cache, a metrics sink). The app keeps running and the load balancer is informed via `/readyz`.
 
 **Use `TierAuxiliary`** for components whose failure is entirely non-blocking (e.g. an audit log sink, a tracing exporter).
+
+### Failure model
+
+Each component goes through these states:
+
+```
+          start failure
+               │
+[Starting] ───────────────► [Failed] ─── if restart policy allows ──► [Starting]
+               │                                                            ↑
+           ready() called                                                   │
+               │                                                      stop + delay
+           [Running]                                                        │
+               │                                                            │
+        health check fails ──────────────────────────────────────────────────
+               │
+        restart policy exhausted
+               │
+           [Permanently Failed]
+               │
+        TierCritical/Significant ──► shutdown
+        TierAuxiliary            ──► removed from monitoring, app continues
+```
+
+Recovery is automatic: if a restarted component calls `ready()` and health checks pass, `OnRecovered` fires and `/readyz` flips back to 200.
 
 ---
 
 ## Restart policies
 
 ```go
-frame.NeverRestart()                             // fail once → done (default)
-frame.AlwaysRestart(2*time.Second)               // retry forever with fixed delay
-frame.MaxRetries(5, time.Second)                 // up to 5 retries, fixed delay
-frame.ExponentialBackoff(5, time.Second)         // 1s, 2s, 4s, 8s, 16s (±25% jitter)
+frame.NeverRestart()                         // fail once → permanent (default)
+frame.AlwaysRestart(2*time.Second)           // retry forever, fixed delay
+frame.MaxRetries(5, time.Second)             // up to 5 retries, fixed delay
+frame.ExponentialBackoff(5, time.Second)     // 1s, 2s, 4s, 8s, 16s (±25% jitter)
 ```
 
-The restart attempt counter resets to zero if the component has been running without fault for longer than `WithRestartResetWindow` (default 5 minutes).
+The attempt counter resets to zero if the component runs without fault for longer than `WithRestartResetWindow` (default 5 minutes).
+
+### When to use restarts vs when to crash
+
+Use internal restarts for components whose failure is transient and independent — a cache client that loses its connection, a queue consumer that gets disconnected, a metrics exporter. These are safe to restart because their failure doesn't affect application correctness.
+
+Be cautious restarting core request-path components (the primary HTTP server, the main DB pool). A flapping critical component can create a misleading "alive but broken" state. If a component fails repeatedly, consider whether the correct response is to restart it or to crash the pod and let the orchestrator restart the whole process from a clean state.
 
 ---
 
@@ -192,25 +216,33 @@ The supervisor calls `Health` every `WithHealthInterval` (default 10s). A non-ni
 
 ## Health endpoints
 
-`HealthServer` exposes three endpoints for orchestrators:
+`HealthServer` exposes three HTTP endpoints for orchestrators:
 
-| Endpoint | 200 when | Purpose |
+| Endpoint | 200 when | Use for |
 |---|---|---|
 | `GET /livez` | Process is alive | Kubernetes `livenessProbe` |
 | `GET /readyz` | All Critical + Significant components healthy | Kubernetes `readinessProbe` |
 | `GET /healthz` | Same as `/readyz` | Docker `HEALTHCHECK` |
+
+**`/readyz` flips during startup** — it returns 503 until every Critical and Significant component has called `ready()` and passed its first health check.
+
+**`/readyz` flips during shutdown** — the HealthServer stops last, so it returns 503 as soon as shutdown begins, before any other component stops. This drains load balancer connections cleanly.
+
+**Recovery** — if a degraded component recovers, `/readyz` returns 200 again automatically.
 
 `/readyz` response body:
 ```json
 {
   "status": "degraded",
   "components": [
-    { "name": "postgres",    "status": "ok" },
-    { "name": "redis",       "status": "degraded", "error": "connection refused" },
-    { "name": "http-server", "status": "ok" }
+    { "name": "postgres",    "status": "ok",       "restart_count": 0 },
+    { "name": "redis",       "status": "degraded", "error": "connection refused", "restart_count": 2 },
+    { "name": "http-server", "status": "ok",       "restart_count": 0 }
   ]
 }
 ```
+
+`restart_count` is omitted from JSON when zero.
 
 Docker example:
 ```dockerfile
@@ -218,8 +250,7 @@ HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
   CMD wget -qO- http://localhost:8080/healthz || exit 1
 ```
 
-Register `HealthServer` first so it binds its port before any other component starts:
-
+Register `HealthServer` first:
 ```go
 hs := frame.NewHealthServer(sup,
     frame.WithHealthAddr(":8080"),
@@ -232,17 +263,133 @@ sup.Add(hs) // always first
 
 ## Dependency ordering
 
-Components start sequentially in registration order. Use `WithDependencies` to declare explicit ordering when insertion order isn't sufficient:
+Components start sequentially in registration order. Use `WithDependencies` when a component must not start until another is ready:
 
 ```go
-sup.Add(postgres.New(cfg))   // starts first
-sup.Add(redis.New(cfg))      // starts second
-sup.Add(httpServer,          // starts only after postgres AND redis are ready
+sup.Add(postgres.New(cfg))
+sup.Add(redis.New(cfg))
+sup.Add(httpServer,
     frame.WithDependencies("postgres", "redis"),
 )
 ```
 
-On shutdown, components stop in **reverse** start order — so `httpServer` stops before `postgres` and `redis`, ensuring no in-flight requests try to use a closed pool.
+`httpServer` starts only after both `postgres` and `redis` have called `ready()`. On shutdown, components stop in reverse start order — `httpServer` stops before `postgres` and `redis`, so no in-flight requests touch a closed pool.
+
+---
+
+## Pitfalls and best practices
+
+### Call `ready()` too early
+
+```go
+// ❌ Wrong — ready() before the connection is verified
+func (c *Cache) Start(ctx context.Context, ready func()) error {
+    c.client = redis.NewClient(opts) // lazy — no connection yet
+    ready()                          // supervisor proceeds, but cache may be broken
+    <-ctx.Done()
+    return nil
+}
+
+// ✅ Right — ready() only after a successful ping
+func (c *Cache) Start(ctx context.Context, ready func()) error {
+    c.client = redis.NewClient(opts)
+    if err := c.client.Ping(ctx).Err(); err != nil {
+        return err
+    }
+    ready()
+    <-ctx.Done()
+    return nil
+}
+```
+
+### Forget to unblock Start on Stop
+
+```go
+// ❌ Wrong — Stop closes the client but Start blocks forever
+func (s *Server) Start(ctx context.Context, ready func()) error {
+    ready()
+    for job := range s.jobs { process(job) } // blocks; Stop never unblocks this
+    return nil
+}
+
+// ✅ Right — Stop signals Start to exit
+func (s *Server) Start(ctx context.Context, ready func()) error {
+    s.stop = make(chan struct{})
+    ready()
+    select {
+    case <-s.stop:
+    case <-ctx.Done():
+    }
+    return nil
+}
+func (s *Server) Stop(_ context.Context) error {
+    close(s.stop)
+    return nil
+}
+```
+
+### Leak goroutines after Stop
+
+```go
+// ❌ Wrong — background goroutine outlives the component
+func (w *Worker) Start(ctx context.Context, ready func()) error {
+    go w.runLoop() // no way to stop this
+    ready()
+    <-ctx.Done()
+    return nil
+}
+
+// ✅ Right — goroutine exits when ctx is cancelled
+func (w *Worker) Start(ctx context.Context, ready func()) error {
+    go w.runLoop(ctx) // ctx cancellation stops the loop
+    ready()
+    <-ctx.Done()
+    return nil
+}
+```
+
+### Return non-nil error on clean shutdown
+
+```go
+// ❌ Wrong — ctx.Err() looks like a failure to the supervisor
+func (s *Server) Start(ctx context.Context, ready func()) error {
+    ready()
+    <-ctx.Done()
+    return ctx.Err() // returns context.Canceled — treated as a crash
+}
+
+// ✅ Right
+func (s *Server) Start(ctx context.Context, ready func()) error {
+    ready()
+    <-ctx.Done()
+    return nil
+}
+```
+
+---
+
+## Runtime status
+
+Inspect all component states at any time via the supervisor:
+
+```go
+for _, status := range sup.HealthReportOrdered() {
+    fmt.Printf("%-20s healthy=%-5v restarts=%d\n",
+        status.Name,
+        status.Err == nil,
+        status.RestartCount,
+    )
+}
+```
+
+`ComponentStatus` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `Err` | `error` | `nil` = healthy; non-nil = last health check error |
+| `Known` | `bool` | `false` until first health check completes |
+| `Tier` | `Tier` | `TierCritical`, `TierSignificant`, or `TierAuxiliary` |
+| `RestartCount` | `int` | How many times the supervisor has restarted this component |
 
 ---
 
@@ -259,28 +406,22 @@ type MetricsObserver interface {
 }
 ```
 
-```go
-sup := frame.NewSupervisor(
-    frame.WithMetricsObserver(&prometheusAdapter{}),
-)
-```
-
 ---
 
 ## Programmatic shutdown
 
 ```go
-app := frame.NewApplication(...)
-
-// From any goroutine — attaches a cause visible via context.Cause(ctx):
 app.Shutdown(errors.New("config reload required"))
+// cause is available inside Start/main via context.Cause(ctx)
 ```
+
+`app.Shutdown(nil)` is a clean shutdown — same semantics as Ctrl+C, returns nil from `app.Run()`.
 
 ---
 
 ## Logger interface
 
-`frame.Logger` is satisfied directly by `*slog.Logger`, `*zap.SugaredLogger`, and most structured loggers:
+`frame.Logger` is satisfied directly by `*slog.Logger` and most structured loggers:
 
 ```go
 frame.WithLogger(slog.Default())
