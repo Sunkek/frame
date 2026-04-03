@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -55,8 +56,8 @@ func (m *mockComponent) Start(ctx context.Context, ready func()) error {
 	if m.shouldFail.Load() {
 		return errFake
 	}
-	m.startedOnce.Do(func() { close(m.started) })
 	ready()
+	m.startedOnce.Do(func() { close(m.started) })
 	select {
 	case <-m.stop:
 	case <-ctx.Done():
@@ -655,10 +656,10 @@ func (m *delayedReadyComponent) Start(ctx context.Context, ready func()) error {
 	if m.shouldFail.Load() {
 		return errFake
 	}
-	m.startedOnce.Do(func() { close(m.started) })
 	select {
 	case <-time.After(m.readyDelay):
 		ready()
+		m.startedOnce.Do(func() { close(m.started) })
 	case <-ctx.Done():
 		return nil
 	}
@@ -972,6 +973,35 @@ func (c *neverReadyComponent) Stop(_ context.Context) error {
 
 // ── Shutdown with cause (#6) ─────────────────────────────────────────────────
 
+func TestApplication_OsSignalShutdown_ReturnsNil(t *testing.T) {
+	// A clean OS-signal-triggered shutdown must return nil — not an error.
+	// We simulate this by cancelling the parent context directly, which is
+	// equivalent to what signal.NotifyContext does on Ctrl+C.
+	sup := frame.NewSupervisor()
+	mc := newMock("svc")
+	sup.Add(mc)
+
+	app := frame.NewApplication(
+		frame.WithSupervisor(sup),
+		frame.WithShutdownTimeout(5*time.Second),
+	)
+
+	done := make(chan error, 1)
+	go func() { done <- app.Run() }()
+
+	waitStarted(t, mc, 2*time.Second)
+	app.Shutdown(nil) // nil cause = clean shutdown, same semantics as Ctrl+C
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("clean shutdown should return nil, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("application did not stop in time")
+	}
+}
+
 func TestApplication_ShutdownWithCause(t *testing.T) {
 	shutdownCause := errors.New("planned maintenance")
 
@@ -1043,4 +1073,258 @@ func TestHealthReportOrdered_Deterministic(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// ── additional coverage ───────────────────────────────────────────────────────
+
+func TestSupervisor_SignificantUnhealthy_DegradedNotShutdown(t *testing.T) {
+	// A TierSignificant component that is transiently unhealthy should not shut
+	// the app down. It will be restarted by the restart policy, and its unhealthy
+	// state should be visible in the health report while it is down.
+	sup := frame.NewSupervisor(
+		frame.WithHealthInterval(20*time.Millisecond),
+		frame.WithHealthTimeout(10*time.Millisecond),
+	)
+	sig := newMock("cache")
+	sup.Add(sig,
+		frame.WithTier(frame.TierSignificant),
+		frame.WithRestartPolicy(frame.AlwaysRestart(5*time.Millisecond)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, sig, 2*time.Second)
+	sig.setHealthErr(errFake)
+
+	// App must stay alive despite the Significant component being unhealthy.
+	select {
+	case err := <-done:
+		t.Fatalf("supervisor exited unexpectedly: %v", err)
+	case <-time.After(150 * time.Millisecond):
+		// good — still running
+	}
+
+	// Confirm the degraded state is visible in the health report.
+	deadline := time.Now().Add(time.Second)
+	var foundDegraded bool
+	for time.Now().Before(deadline) {
+		for _, s := range sup.HealthReportOrdered() {
+			if s.Name == "cache" && s.Err != nil {
+				foundDegraded = true
+			}
+		}
+		if foundDegraded {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !foundDegraded {
+		t.Error("expected cache to appear degraded in HealthReport")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestSupervisor_ComponentRestartAndRecover(t *testing.T) {
+	// A component that fails health checks should be restarted and eventually
+	// come back healthy. The supervisor should not shut down.
+	sup := frame.NewSupervisor(
+		frame.WithHealthInterval(20*time.Millisecond),
+		frame.WithHealthTimeout(10*time.Millisecond),
+	)
+	mc := newMock("db")
+	sup.Add(mc,
+		frame.WithTier(frame.TierCritical),
+		frame.WithRestartPolicy(frame.MaxRetries(5, 5*time.Millisecond)),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 2*time.Second)
+
+	// Make it unhealthy — this triggers a stop+restart cycle.
+	mc.setHealthErr(errFake)
+
+	// Wait for at least one restart (startCalled > 1).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if mc.startCalled.Load() > 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mc.startCalled.Load() <= 1 {
+		t.Fatal("component was not restarted after health failure")
+	}
+
+	// Clear the health error — component should recover.
+	mc.setHealthErr(nil)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error after restart cycle: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("supervisor did not stop cleanly after restart cycle")
+	}
+}
+
+func TestSupervisor_DependencyFails_DependentNeverStarts(t *testing.T) {
+	// If a dependency fails to start, its dependent must never be started.
+	sup := frame.NewSupervisor()
+
+	dep := newMock("dep")
+	dep.shouldFail.Store(true) // dep always fails immediately
+
+	svc := newMock("svc")
+
+	sup.Add(dep, frame.WithRestartPolicy(frame.NeverRestart()))
+	sup.Add(svc, frame.WithDependencies("dep"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := sup.Run(ctx)
+	if err == nil {
+		t.Fatal("expected error from failing dependency")
+	}
+	if svc.startCalled.Load() != 0 {
+		t.Errorf("svc should never have been started, but startCalled=%d", svc.startCalled.Load())
+	}
+}
+
+// recordingComponent is a Component that records the order in which Stop is
+// called into a shared slice, enabling stop-order assertions.
+type recordingComponent struct {
+	*mockComponent
+	mu    *sync.Mutex
+	order *[]string
+}
+
+func newRecording(name string, mu *sync.Mutex, order *[]string) *recordingComponent {
+	return &recordingComponent{
+		mockComponent: newMock(name),
+		mu:            mu,
+		order:         order,
+	}
+}
+
+func (r *recordingComponent) Stop(ctx context.Context) error {
+	r.mu.Lock()
+	*r.order = append(*r.order, r.Name())
+	r.mu.Unlock()
+	return r.mockComponent.Stop(ctx)
+}
+
+func TestSupervisor_StopOrder_ReverseOfStart(t *testing.T) {
+	// Components registered in order a→b→c must be stopped in order c→b→a.
+	// Run 20 times to catch map-iteration non-determinism.
+	for range 20 {
+		sup := frame.NewSupervisor()
+
+		var mu sync.Mutex
+		var stopOrder []string
+
+		a := newRecording("a", &mu, &stopOrder)
+		b := newRecording("b", &mu, &stopOrder)
+		c := newRecording("c", &mu, &stopOrder)
+
+		sup.Add(a)
+		sup.Add(b)
+		sup.Add(c)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- sup.Run(ctx) }()
+
+		waitStarted(t, a.mockComponent, 2*time.Second)
+		waitStarted(t, b.mockComponent, 2*time.Second)
+		waitStarted(t, c.mockComponent, 2*time.Second)
+
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("supervisor did not stop in time")
+		}
+
+		mu.Lock()
+		got := make([]string, len(stopOrder))
+		copy(got, stopOrder)
+		mu.Unlock()
+
+		want := []string{"c", "b", "a"}
+		if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+			t.Errorf("stop order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestSupervisor_AddAfterRun_Panics(t *testing.T) {
+	sup := frame.NewSupervisor()
+	mc := newMock("svc")
+	sup.Add(mc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitStarted(t, mc, 2*time.Second)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when Add called after Run started")
+		}
+		cancel()
+		<-done
+	}()
+	sup.Add(newMock("late"))
+}
+
+func TestApplication_SupervisorFailure_PropagatesError(t *testing.T) {
+	// When a critical component fails, Application.Run should return a
+	// non-nil error that describes the failure.
+	sup := frame.NewSupervisor(
+		frame.WithHealthInterval(20*time.Millisecond),
+		frame.WithHealthTimeout(10*time.Millisecond),
+	)
+	mc := newMock("db")
+	sup.Add(mc,
+		frame.WithTier(frame.TierCritical),
+		frame.WithRestartPolicy(frame.NeverRestart()),
+	)
+
+	app := frame.NewApplication(
+		frame.WithSupervisor(sup),
+		frame.WithShutdownTimeout(5*time.Second),
+	)
+
+	done := make(chan error, 1)
+	go func() { done <- app.Run() }()
+
+	waitStarted(t, mc, 2*time.Second)
+	mc.setHealthErr(errFake)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected non-nil error when critical component fails")
+		}
+		// The error message must mention the component name.
+		if !strings.Contains(err.Error(), "db") {
+			t.Errorf("error should mention component name 'db': %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("application did not exit after critical component failure")
+	}
 }

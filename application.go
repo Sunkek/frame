@@ -95,6 +95,13 @@ func NewApplication(opts ...ApplicationOption) *Application {
 	}
 }
 
+// isContextError reports whether err is (or wraps) a standard context
+// cancellation or deadline error. These indicate an externally-triggered
+// shutdown, not a component failure, and should be treated as clean exits.
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // Shutdown cancels the application's root context, triggering a graceful
 // shutdown. The optional cause is attached to the context so that components
 // and the main function can inspect it via context.Cause if needed.
@@ -160,6 +167,13 @@ func (a *Application) Run() error {
 		go func() {
 			defer wg.Done()
 			if err := a.supervisor.Run(rootCtx); err != nil {
+				// An OS signal cancels the root context, which propagates into
+				// the supervisor as a context error. That is a clean shutdown,
+				// not a failure — filter it out so we don't log it as an error
+				// or return a non-zero exit code.
+				if isContextError(rootCtx.Err()) {
+					return
+				}
 				a.logger.Error("supervisor exited with error", "error", err)
 				errCh <- err
 				cancelRoot(err)

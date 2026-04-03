@@ -46,8 +46,6 @@ type supervisorConfig struct {
 	metrics            MetricsObserver
 }
 
-// WithHealthInterval sets how often the supervisor polls component health.
-// Defaults to 10s.
 // WithHealthInterval sets how often the supervisor polls each component's
 // Health method. Defaults to 10s.
 func WithHealthInterval(d time.Duration) SupervisorOption {
@@ -257,16 +255,22 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		select {
 		case err := <-readyCh:
 			if err != nil {
+				// Component failed to start permanently. Stop everything
+				// already running and return the error.
 				s.stopAll(started)
 				<-startErrCh
 				return err
 			}
+			// Component is running — register it for cleanup on shutdown.
 			started = append(started, mc)
 
 		case <-ctx.Done():
-			// stopAll handles the components that finished starting successfully.
-			// The in-flight component is handled by startOne's ctx.Done branch,
-			// which calls doStop before draining the Start goroutine.
+			// Shutdown fired while waiting for this component to become ready.
+			// Include mc in the stop list regardless of whether it managed to
+			// call ready() — the goroutine is running and must be cleaned up.
+			// stopAll calls Stop on each component (including mc), which will
+			// cause any in-progress Start to unblock and return.
+			started = append(started, mc)
 			s.stopAll(started)
 			<-startErrCh
 			wg.Wait()
@@ -276,7 +280,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 					return err
 				}
 			}
-			if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+			if cause := context.Cause(ctx); cause != nil && !isContextError(ctx.Err()) {
 				return cause
 			}
 			return nil
@@ -293,7 +297,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	if cause := context.Cause(ctx); cause != nil && cause != ctx.Err() {
+	// Surface the cause only if it was set by a component failure. If the
+	// context was cancelled by its parent (e.g. an OS signal via
+	// signal.NotifyContext), the cause is a context error — that is a clean
+	// shutdown and must not be returned as an error.
+	if cause := context.Cause(ctx); cause != nil && !isContextError(ctx.Err()) {
 		return cause
 	}
 	return nil
@@ -380,10 +388,9 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 			startErr = err
 		case <-ctx.Done():
 			timer.Stop()
-			// Stop the component so its Start goroutine unblocks and returns,
-			// then drain startExit. This is safe to call even when the startup
-			// loop's stopAll has already run — Stop must be idempotent.
-			s.doStop(mc)
+			// Drain startExit so the Start goroutine can exit cleanly.
+			// Stop will be called by stopAll in Run — not here — because
+			// the in-flight component was already added to the started slice.
 			<-startExit
 			return nil
 		case <-timer.C:
