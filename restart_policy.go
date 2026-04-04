@@ -1,4 +1,4 @@
-package frame
+package samsara
 
 import (
 	"math/rand/v2"

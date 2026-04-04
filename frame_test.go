@@ -1,4 +1,4 @@
-package frame_test
+package samsara_test
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sunkek/frame"
+	"github.com/sunkek/samsara"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ func waitStarted(t *testing.T, m *mockComponent, timeout time.Duration) {
 // ── RestartPolicy ─────────────────────────────────────────────────────────────
 
 func TestNeverRestart(t *testing.T) {
-	p := frame.NeverRestart()
+	p := samsara.NeverRestart()
 	restart, _ := p.ShouldRestart(errFake, 0)
 	if restart {
 		t.Fatal("NeverRestart should return false")
@@ -114,7 +114,7 @@ func TestNeverRestart(t *testing.T) {
 }
 
 func TestAlwaysRestart(t *testing.T) {
-	p := frame.AlwaysRestart(10 * time.Millisecond)
+	p := samsara.AlwaysRestart(10 * time.Millisecond)
 	for i := range 10 {
 		restart, delay := p.ShouldRestart(errFake, i)
 		if !restart {
@@ -127,7 +127,7 @@ func TestAlwaysRestart(t *testing.T) {
 }
 
 func TestMaxRetries(t *testing.T) {
-	p := frame.MaxRetries(3, 5*time.Millisecond)
+	p := samsara.MaxRetries(3, 5*time.Millisecond)
 	for i := range 3 {
 		restart, _ := p.ShouldRestart(errFake, i)
 		if !restart {
@@ -142,7 +142,7 @@ func TestMaxRetries(t *testing.T) {
 
 func TestExponentialBackoff(t *testing.T) {
 	base := 10 * time.Millisecond
-	p := frame.ExponentialBackoff(4, base)
+	p := samsara.ExponentialBackoff(4, base)
 	// Each attempt's nominal delay doubles; ±25% jitter is applied so the
 	// actual delay falls in [0.75×nominal, 1.25×nominal).
 	nominals := []time.Duration{base, 2 * base, 4 * base, 8 * base}
@@ -166,8 +166,8 @@ func TestExponentialBackoff(t *testing.T) {
 // ── Supervisor: basic lifecycle ───────────────────────────────────────────────
 
 func TestSupervisor_StartsAndStops(t *testing.T) {
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(100 * time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(100 * time.Millisecond),
 	)
 	mc := newMock("alpha")
 	sup.Add(mc)
@@ -195,8 +195,8 @@ func TestSupervisor_StartsAndStops(t *testing.T) {
 
 func TestSupervisor_DependencyOrder(t *testing.T) {
 	// db → cache → app: db must start first, stop last.
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(50 * time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(50 * time.Millisecond),
 	)
 
 	db := newMock("db")
@@ -204,8 +204,8 @@ func TestSupervisor_DependencyOrder(t *testing.T) {
 	app := newMock("app")
 
 	sup.Add(db)
-	sup.Add(cache, frame.WithDependencies("db"))
-	sup.Add(app, frame.WithDependencies("cache"))
+	sup.Add(cache, samsara.WithDependencies("db"))
+	sup.Add(app, samsara.WithDependencies("cache"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -244,7 +244,7 @@ func TestSupervisor_InsertionOrderRespected(t *testing.T) {
 	// and stop in reverse Add() order. Run this multiple times to catch any
 	// map-iteration non-determinism.
 	for range 20 {
-		sup := frame.NewSupervisor()
+		sup := samsara.NewSupervisor()
 
 		first := newMock("first")
 		second := newMock("second")
@@ -281,31 +281,31 @@ func TestSupervisor_InsertionOrderRespected(t *testing.T) {
 }
 
 func TestSupervisor_CircularDependency(t *testing.T) {
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	a := newMock("a")
 	b := newMock("b")
-	sup.Add(a, frame.WithDependencies("b"))
-	sup.Add(b, frame.WithDependencies("a"))
+	sup.Add(a, samsara.WithDependencies("b"))
+	sup.Add(b, samsara.WithDependencies("a"))
 
 	err := sup.Run(context.Background())
-	if !errors.Is(err, frame.ErrCircularDependency) {
+	if !errors.Is(err, samsara.ErrCircularDependency) {
 		t.Fatalf("expected ErrCircularDependency, got: %v", err)
 	}
 }
 
 func TestSupervisor_UnknownDependency(t *testing.T) {
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	mc := newMock("alpha")
-	sup.Add(mc, frame.WithDependencies("nonexistent"))
+	sup.Add(mc, samsara.WithDependencies("nonexistent"))
 
 	err := sup.Run(context.Background())
-	if !errors.Is(err, frame.ErrUnknownDependency) {
+	if !errors.Is(err, samsara.ErrUnknownDependency) {
 		t.Fatalf("expected ErrUnknownDependency, got: %v", err)
 	}
 }
 
 func TestSupervisor_DuplicateComponentPanics(t *testing.T) {
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	sup.Add(newMock("alpha"))
 	defer func() {
 		if r := recover(); r == nil {
@@ -318,10 +318,10 @@ func TestSupervisor_DuplicateComponentPanics(t *testing.T) {
 // ── Supervisor: start failure ─────────────────────────────────────────────────
 
 func TestSupervisor_StartFailure_NeverRestart(t *testing.T) {
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	mc := newMock("broken")
 	mc.shouldFail.Store(true)
-	sup.Add(mc, frame.WithRestartPolicy(frame.NeverRestart()))
+	sup.Add(mc, samsara.WithRestartPolicy(samsara.NeverRestart()))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -339,7 +339,7 @@ func TestSupervisor_StartFailure_WithRetries(t *testing.T) {
 	// Probe window = 5ms, retry delay = 10ms → each failed attempt costs ~15ms.
 	// We allow 20 retries (300ms budget) and disable failures after 100ms,
 	// which gives ~6 failed attempts before recovery with plenty of room left.
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	mc := newMock("flaky")
 	mc.shouldFail.Store(true)
 
@@ -348,7 +348,7 @@ func TestSupervisor_StartFailure_WithRetries(t *testing.T) {
 		mc.shouldFail.Store(false)
 	}()
 
-	sup.Add(mc, frame.WithRestartPolicy(frame.MaxRetries(20, 10*time.Millisecond)))
+	sup.Add(mc, samsara.WithRestartPolicy(samsara.MaxRetries(20, 10*time.Millisecond)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -370,15 +370,15 @@ func TestSupervisor_StartFailure_WithRetries(t *testing.T) {
 // ── Supervisor: health / tier interaction ─────────────────────────────────────
 
 func TestSupervisor_CriticalUnhealthy_TriggersShutdown(t *testing.T) {
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
-		frame.WithStartTimeout(50*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
+		samsara.WithStartTimeout(50*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc,
-		frame.WithTier(frame.TierCritical),
-		frame.WithRestartPolicy(frame.NeverRestart()),
+		samsara.WithTier(samsara.TierCritical),
+		samsara.WithRestartPolicy(samsara.NeverRestart()),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -403,14 +403,14 @@ func TestSupervisor_CriticalUnhealthy_TriggersShutdown(t *testing.T) {
 }
 
 func TestSupervisor_AuxiliaryUnhealthy_DoesNotShutdown(t *testing.T) {
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(5*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(5*time.Millisecond),
 	)
 	aux := newMock("metrics")
 	sup.Add(aux,
-		frame.WithTier(frame.TierAuxiliary),
-		frame.WithRestartPolicy(frame.NeverRestart()),
+		samsara.WithTier(samsara.TierAuxiliary),
+		samsara.WithRestartPolicy(samsara.NeverRestart()),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -440,7 +440,7 @@ func TestEventHooks_Fired(t *testing.T) {
 	unhealthyCh := make(chan struct{}, 1)
 	failedCh := make(chan struct{}, 1)
 
-	hooks := &frame.EventHooks{
+	hooks := &samsara.EventHooks{
 		OnUnhealthy: func(c string, err error) {
 			select {
 			case unhealthyCh <- struct{}{}:
@@ -455,16 +455,16 @@ func TestEventHooks_Fired(t *testing.T) {
 		},
 	}
 
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
-		frame.WithStartTimeout(50*time.Millisecond),
-		frame.WithEventHooks(hooks),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
+		samsara.WithStartTimeout(50*time.Millisecond),
+		samsara.WithEventHooks(hooks),
 	)
 	mc := newMock("db")
 	sup.Add(mc,
-		frame.WithTier(frame.TierCritical),
-		frame.WithRestartPolicy(frame.NeverRestart()),
+		samsara.WithTier(samsara.TierCritical),
+		samsara.WithRestartPolicy(samsara.NeverRestart()),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -505,18 +505,18 @@ func TestEventHooks_Fired(t *testing.T) {
 
 func TestApplication_CleanShutdown(t *testing.T) {
 	mc := newMock("svc")
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	sup.Add(mc)
 
 	mainDone := make(chan struct{})
-	app := frame.NewApplication(
-		frame.WithSupervisor(sup),
-		frame.WithMainFunc(func(ctx context.Context) error {
+	app := samsara.NewApplication(
+		samsara.WithSupervisor(sup),
+		samsara.WithMainFunc(func(ctx context.Context) error {
 			<-ctx.Done()
 			close(mainDone)
 			return nil
 		}),
-		frame.WithShutdownTimeout(5*time.Second),
+		samsara.WithShutdownTimeout(5*time.Second),
 	)
 
 	done := make(chan error, 1)
@@ -543,8 +543,8 @@ func TestApplication_CleanShutdown(t *testing.T) {
 }
 
 func TestApplication_MainFuncError(t *testing.T) {
-	app := frame.NewApplication(
-		frame.WithMainFunc(func(ctx context.Context) error {
+	app := samsara.NewApplication(
+		samsara.WithMainFunc(func(ctx context.Context) error {
 			return errFake
 		}),
 	)
@@ -556,9 +556,9 @@ func TestApplication_MainFuncError(t *testing.T) {
 }
 
 func TestApplication_NoMainFunc_NoSupervisor(t *testing.T) {
-	app := frame.NewApplication()
+	app := samsara.NewApplication()
 	err := app.Run()
-	if !errors.Is(err, frame.ErrNothingToRun) {
+	if !errors.Is(err, samsara.ErrNothingToRun) {
 		t.Fatalf("expected ErrNothingToRun, got: %v", err)
 	}
 }
@@ -566,14 +566,14 @@ func TestApplication_NoMainFunc_NoSupervisor(t *testing.T) {
 // ── HealthServer ──────────────────────────────────────────────────────────────
 
 func TestHealthServer_Endpoints(t *testing.T) {
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(50*time.Millisecond),
-		frame.WithStartTimeout(2*time.Second),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(50*time.Millisecond),
+		samsara.WithStartTimeout(2*time.Second),
 	)
 
-	hs := frame.NewHealthServer(sup, frame.WithHealthAddr(":19090"))
+	hs := samsara.NewHealthServer(sup, samsara.WithHealthAddr(":19090"))
 	// Register health server first so it starts before other components.
-	sup.Add(hs, frame.WithTier(frame.TierCritical))
+	sup.Add(hs, samsara.WithTier(samsara.TierCritical))
 
 	mc := newMock("db")
 	sup.Add(mc)
@@ -673,7 +673,7 @@ func (m *delayedReadyComponent) Start(ctx context.Context, ready func()) error {
 func TestReady_PreciseReadiness(t *testing.T) {
 	// Component calls ready() after 5ms. The supervisor should proceed to the
 	// next component in ~5ms, well within the 15s startTimeout.
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 
 	sm := newDelayedReady("precise", 5*time.Millisecond)
 	sup.Add(sm)
@@ -705,12 +705,12 @@ func TestReady_PreciseReadiness(t *testing.T) {
 func TestReady_DependentWaitsForReady(t *testing.T) {
 	// dep delays ready() by 50ms. svc depends on dep — svc must not start
 	// until dep has called ready().
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 
 	dep := newDelayedReady("dep", 50*time.Millisecond)
 	svc := newMock("svc")
 	sup.Add(dep)
-	sup.Add(svc, frame.WithDependencies("dep"))
+	sup.Add(svc, samsara.WithDependencies("dep"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -778,8 +778,8 @@ func (m *captureMetrics) checksCount() int {
 
 func TestMetricsObserver_StartStop(t *testing.T) {
 	obs := &captureMetrics{}
-	sup := frame.NewSupervisor(
-		frame.WithMetricsObserver(obs),
+	sup := samsara.NewSupervisor(
+		samsara.WithMetricsObserver(obs),
 	)
 	mc := newMock("svc")
 	sup.Add(mc)
@@ -818,10 +818,10 @@ func TestMetricsObserver_StartStop(t *testing.T) {
 
 func TestMetricsObserver_HealthChecks(t *testing.T) {
 	obs := &captureMetrics{}
-	sup := frame.NewSupervisor(
-		frame.WithMetricsObserver(obs),
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithMetricsObserver(obs),
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc)
@@ -849,8 +849,8 @@ func TestMetricsObserver_HealthChecks(t *testing.T) {
 
 func TestMetricsObserver_Restarts(t *testing.T) {
 	obs := &captureMetrics{}
-	sup := frame.NewSupervisor(
-		frame.WithMetricsObserver(obs),
+	sup := samsara.NewSupervisor(
+		samsara.WithMetricsObserver(obs),
 	)
 	mc := newMock("svc")
 	mc.shouldFail.Store(true)
@@ -858,7 +858,7 @@ func TestMetricsObserver_Restarts(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		mc.shouldFail.Store(false)
 	}()
-	sup.Add(mc, frame.WithRestartPolicy(frame.MaxRetries(20, 5*time.Millisecond)))
+	sup.Add(mc, samsara.WithRestartPolicy(samsara.MaxRetries(20, 5*time.Millisecond)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -882,14 +882,14 @@ func TestContextCause_CriticalFailure(t *testing.T) {
 	// When a critical component fails, the error returned by Supervisor.Run
 	// should be the specific component failure error, not a generic
 	// "context canceled".
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc,
-		frame.WithTier(frame.TierCritical),
-		frame.WithRestartPolicy(frame.NeverRestart()),
+		samsara.WithTier(samsara.TierCritical),
+		samsara.WithRestartPolicy(samsara.NeverRestart()),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -918,7 +918,7 @@ func TestContextCause_CriticalFailure(t *testing.T) {
 
 func TestHealthReporter_Interface(t *testing.T) {
 	// *Supervisor must satisfy HealthReporter.
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	mc := newMock("svc")
 	sup.Add(mc)
 
@@ -949,12 +949,12 @@ func TestHealthReporter_Interface(t *testing.T) {
 
 func TestStartTimeout_NeverCallsReady(t *testing.T) {
 	// A component that never calls ready() should be failed by startTimeout.
-	sup := frame.NewSupervisor(
-		frame.WithStartTimeout(50 * time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithStartTimeout(50 * time.Millisecond),
 	)
 
 	hungSvc := &neverReadyComponent{stop: make(chan struct{})}
-	sup.Add(hungSvc, frame.WithRestartPolicy(frame.NeverRestart()))
+	sup.Add(hungSvc, samsara.WithRestartPolicy(samsara.NeverRestart()))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -993,13 +993,13 @@ func TestApplication_OsSignalShutdown_ReturnsNil(t *testing.T) {
 	// A clean OS-signal-triggered shutdown must return nil — not an error.
 	// We simulate this by cancelling the parent context directly, which is
 	// equivalent to what signal.NotifyContext does on Ctrl+C.
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	mc := newMock("svc")
 	sup.Add(mc)
 
-	app := frame.NewApplication(
-		frame.WithSupervisor(sup),
-		frame.WithShutdownTimeout(5*time.Second),
+	app := samsara.NewApplication(
+		samsara.WithSupervisor(sup),
+		samsara.WithShutdownTimeout(5*time.Second),
 	)
 
 	done := make(chan error, 1)
@@ -1022,8 +1022,8 @@ func TestApplication_ShutdownWithCause(t *testing.T) {
 	shutdownCause := errors.New("planned maintenance")
 
 	var receivedCause error
-	app := frame.NewApplication(
-		frame.WithMainFunc(func(ctx context.Context) error {
+	app := samsara.NewApplication(
+		samsara.WithMainFunc(func(ctx context.Context) error {
 			<-ctx.Done()
 			receivedCause = context.Cause(ctx)
 			return nil
@@ -1054,7 +1054,7 @@ func TestApplication_ShutdownWithCause(t *testing.T) {
 // ── HealthReportOrdered determinism (#5) ─────────────────────────────────────
 
 func TestHealthReportOrdered_Deterministic(t *testing.T) {
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	z := newMock("zebra")
 	a := newMock("alpha")
 	m := newMock("mango")
@@ -1097,14 +1097,14 @@ func TestSupervisor_SignificantUnhealthy_DegradedNotShutdown(t *testing.T) {
 	// A TierSignificant component that is transiently unhealthy should not shut
 	// the app down. It will be restarted by the restart policy, and its unhealthy
 	// state should be visible in the health report while it is down.
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
 	)
 	sig := newMock("cache")
 	sup.Add(sig,
-		frame.WithTier(frame.TierSignificant),
-		frame.WithRestartPolicy(frame.AlwaysRestart(5*time.Millisecond)),
+		samsara.WithTier(samsara.TierSignificant),
+		samsara.WithRestartPolicy(samsara.AlwaysRestart(5*time.Millisecond)),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1147,14 +1147,14 @@ func TestSupervisor_SignificantUnhealthy_DegradedNotShutdown(t *testing.T) {
 func TestSupervisor_ComponentRestartAndRecover(t *testing.T) {
 	// A component that fails health checks should be restarted and eventually
 	// come back healthy. The supervisor should not shut down.
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc,
-		frame.WithTier(frame.TierCritical),
-		frame.WithRestartPolicy(frame.MaxRetries(5, 5*time.Millisecond)),
+		samsara.WithTier(samsara.TierCritical),
+		samsara.WithRestartPolicy(samsara.MaxRetries(5, 5*time.Millisecond)),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1194,15 +1194,15 @@ func TestSupervisor_ComponentRestartAndRecover(t *testing.T) {
 
 func TestSupervisor_DependencyFails_DependentNeverStarts(t *testing.T) {
 	// If a dependency fails to start, its dependent must never be started.
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 
 	dep := newMock("dep")
 	dep.shouldFail.Store(true) // dep always fails immediately
 
 	svc := newMock("svc")
 
-	sup.Add(dep, frame.WithRestartPolicy(frame.NeverRestart()))
-	sup.Add(svc, frame.WithDependencies("dep"))
+	sup.Add(dep, samsara.WithRestartPolicy(samsara.NeverRestart()))
+	sup.Add(svc, samsara.WithDependencies("dep"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1243,7 +1243,7 @@ func TestSupervisor_StopOrder_ReverseOfStart(t *testing.T) {
 	// Components registered in order a→b→c must be stopped in order c→b→a.
 	// Run 20 times to catch map-iteration non-determinism.
 	for range 20 {
-		sup := frame.NewSupervisor()
+		sup := samsara.NewSupervisor()
 
 		var mu sync.Mutex
 		var stopOrder []string
@@ -1287,7 +1287,7 @@ func TestSupervisor_StopOrder_ReverseOfStart(t *testing.T) {
 }
 
 func TestSupervisor_AddAfterRun_Panics(t *testing.T) {
-	sup := frame.NewSupervisor()
+	sup := samsara.NewSupervisor()
 	mc := newMock("svc")
 	sup.Add(mc)
 
@@ -1310,19 +1310,19 @@ func TestSupervisor_AddAfterRun_Panics(t *testing.T) {
 func TestApplication_SupervisorFailure_PropagatesError(t *testing.T) {
 	// When a critical component fails, Application.Run should return a
 	// non-nil error that describes the failure.
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc,
-		frame.WithTier(frame.TierCritical),
-		frame.WithRestartPolicy(frame.NeverRestart()),
+		samsara.WithTier(samsara.TierCritical),
+		samsara.WithRestartPolicy(samsara.NeverRestart()),
 	)
 
-	app := frame.NewApplication(
-		frame.WithSupervisor(sup),
-		frame.WithShutdownTimeout(5*time.Second),
+	app := samsara.NewApplication(
+		samsara.WithSupervisor(sup),
+		samsara.WithShutdownTimeout(5*time.Second),
 	)
 
 	done := make(chan error, 1)
@@ -1350,14 +1350,14 @@ func TestApplication_SupervisorFailure_PropagatesError(t *testing.T) {
 func TestComponentStatus_RestartCountIncrements(t *testing.T) {
 	// Each health-triggered restart must increment RestartCount in the
 	// status report so operators can detect flapping components.
-	sup := frame.NewSupervisor(
-		frame.WithHealthInterval(20*time.Millisecond),
-		frame.WithHealthTimeout(10*time.Millisecond),
+	sup := samsara.NewSupervisor(
+		samsara.WithHealthInterval(20*time.Millisecond),
+		samsara.WithHealthTimeout(10*time.Millisecond),
 	)
 	mc := newMock("db")
 	sup.Add(mc,
-		frame.WithTier(frame.TierCritical),
-		frame.WithRestartPolicy(frame.MaxRetries(5, 5*time.Millisecond)),
+		samsara.WithTier(samsara.TierCritical),
+		samsara.WithRestartPolicy(samsara.MaxRetries(5, 5*time.Millisecond)),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

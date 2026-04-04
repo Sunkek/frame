@@ -1,4 +1,4 @@
-package frame
+package samsara
 
 // EventHooks carries optional callbacks that the Supervisor fires on
 // significant component lifecycle events. All fields are optional; a nil

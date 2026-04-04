@@ -1,11 +1,13 @@
-# frame
+# samsara
 
 A small, explicit lifecycle runtime for Go services — zero external dependencies.
 
-`frame` coordinates the startup, health monitoring, graceful shutdown, and orchestrator integration of your service's infrastructure components. It handles the questions every production service eventually faces: what order do dependencies start? what happens when Redis dies at 3am? when should the pod stop receiving traffic?
+The name comes from the concept of cyclical existence: components fail, are restarted, and return to service. `samsara` makes that cycle explicit, controlled, and observable — rather than something that happens ad hoc in `main.go`.
+
+`samsara` coordinates the startup, health monitoring, graceful shutdown, and orchestrator integration of your service's infrastructure components. It handles the questions every production service eventually faces: what order do dependencies start? what happens when Redis dies at 3am? when should the pod stop receiving traffic?
 
 ```sh
-go get github.com/sunkek/frame
+go get github.com/sunkek/samsara
 ```
 
 ---
@@ -63,8 +65,8 @@ If `Start` spawns background goroutines, they must exit when `ctx` is cancelled 
 
 ```go
 func main() {
-    app := frame.NewApplication(
-        frame.WithMainFunc(func(ctx context.Context) error {
+    app := samsara.NewApplication(
+        samsara.WithMainFunc(func(ctx context.Context) error {
             log.Println("running — press Ctrl+C to stop")
             <-ctx.Done()
             return nil
@@ -86,10 +88,10 @@ func main() {
 func main() {
     logger := slog.Default()
 
-    sup := frame.NewSupervisor(
-        frame.WithSupervisorLogger(logger),
-        frame.WithHealthInterval(10 * time.Second),
-        frame.WithEventHooks(&frame.EventHooks{
+    sup := samsara.NewSupervisor(
+        samsara.WithSupervisorLogger(logger),
+        samsara.WithHealthInterval(10 * time.Second),
+        samsara.WithEventHooks(&samsara.EventHooks{
             OnUnhealthy: func(component string, err error) {
                 logger.Error("component unhealthy", "component", component, "error", err)
             },
@@ -104,32 +106,32 @@ func main() {
 
     // Register HealthServer FIRST — it starts before all other components
     // and stops LAST, keeping orchestrators informed throughout.
-    hs := frame.NewHealthServer(sup, frame.WithHealthAddr(":8080"))
+    hs := samsara.NewHealthServer(sup, samsara.WithHealthAddr(":8080"))
     sup.Add(hs)
 
     sup.Add(postgres.New(cfg.Postgres),
-        frame.WithTier(frame.TierCritical),
-        frame.WithRestartPolicy(frame.ExponentialBackoff(5, time.Second)),
+        samsara.WithTier(samsara.TierCritical),
+        samsara.WithRestartPolicy(samsara.ExponentialBackoff(5, time.Second)),
     )
     sup.Add(redis.New(cfg.Redis),
-        frame.WithTier(frame.TierCritical),
-        frame.WithRestartPolicy(frame.ExponentialBackoff(5, time.Second)),
+        samsara.WithTier(samsara.TierCritical),
+        samsara.WithRestartPolicy(samsara.ExponentialBackoff(5, time.Second)),
     )
     sup.Add(s3.New(cfg.S3),
-        frame.WithTier(frame.TierSignificant),
-        frame.WithRestartPolicy(frame.AlwaysRestart(5*time.Second)),
+        samsara.WithTier(samsara.TierSignificant),
+        samsara.WithRestartPolicy(samsara.AlwaysRestart(5*time.Second)),
     )
     // HTTP server starts only after postgres and redis are ready.
     sup.Add(httpserver.New(cfg.HTTP),
-        frame.WithTier(frame.TierCritical),
-        frame.WithRestartPolicy(frame.MaxRetries(3, 2*time.Second)),
-        frame.WithDependencies("postgres", "redis"),
+        samsara.WithTier(samsara.TierCritical),
+        samsara.WithRestartPolicy(samsara.MaxRetries(3, 2*time.Second)),
+        samsara.WithDependencies("postgres", "redis"),
     )
 
-    app := frame.NewApplication(
-        frame.WithSupervisor(sup),
-        frame.WithLogger(logger),
-        frame.WithShutdownTimeout(30*time.Second),
+    app := samsara.NewApplication(
+        samsara.WithSupervisor(sup),
+        samsara.WithLogger(logger),
+        samsara.WithShutdownTimeout(30*time.Second),
     )
     if err := app.Run(); err != nil {
         logger.Error("application exited with error", "error", err)
@@ -184,10 +186,10 @@ Recovery is automatic: if a restarted component calls `ready()` and health check
 ## Restart policies
 
 ```go
-frame.NeverRestart()                         // fail once → permanent (default)
-frame.AlwaysRestart(2*time.Second)           // retry forever, fixed delay
-frame.MaxRetries(5, time.Second)             // up to 5 retries, fixed delay
-frame.ExponentialBackoff(5, time.Second)     // 1s, 2s, 4s, 8s, 16s (±25% jitter)
+samsara.NeverRestart()                         // fail once → permanent (default)
+samsara.AlwaysRestart(2*time.Second)           // retry forever, fixed delay
+samsara.MaxRetries(5, time.Second)             // up to 5 retries, fixed delay
+samsara.ExponentialBackoff(5, time.Second)     // 1s, 2s, 4s, 8s, 16s (±25% jitter)
 ```
 
 The attempt counter resets to zero if the component runs without fault for longer than `WithRestartResetWindow` (default 5 minutes).
@@ -252,9 +254,9 @@ HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
 
 Register `HealthServer` first:
 ```go
-hs := frame.NewHealthServer(sup,
-    frame.WithHealthAddr(":8080"),
-    frame.WithHealthLogger(logger),
+hs := samsara.NewHealthServer(sup,
+    samsara.WithHealthAddr(":8080"),
+    samsara.WithHealthLogger(logger),
 )
 sup.Add(hs) // always first
 ```
@@ -269,7 +271,7 @@ Components start sequentially in registration order. Use `WithDependencies` when
 sup.Add(postgres.New(cfg))
 sup.Add(redis.New(cfg))
 sup.Add(httpServer,
-    frame.WithDependencies("postgres", "redis"),
+    samsara.WithDependencies("postgres", "redis"),
 )
 ```
 
@@ -421,12 +423,12 @@ app.Shutdown(errors.New("config reload required"))
 
 ## Logger interface
 
-`frame.Logger` is satisfied directly by `*slog.Logger` and most structured loggers:
+`samsara.Logger` is satisfied directly by `*slog.Logger` and most structured loggers:
 
 ```go
-frame.WithLogger(slog.Default())
-frame.WithSupervisorLogger(slog.Default())
-frame.WithHealthLogger(slog.Default())
+samsara.WithLogger(slog.Default())
+samsara.WithSupervisorLogger(slog.Default())
+samsara.WithHealthLogger(slog.Default())
 ```
 
 ---

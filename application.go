@@ -1,4 +1,4 @@
-package frame
+package samsara
 
 import (
 	"context"
@@ -54,14 +54,14 @@ func WithLogger(l Logger) ApplicationOption {
 //
 // Typical usage:
 //
-//	sup := frame.NewSupervisor(...)
-//	sup.Add(myDB, frame.WithTier(frame.TierCritical))
-//	sup.Add(myCache, frame.WithTier(frame.TierSignificant))
+//	sup := samsara.NewSupervisor(...)
+//	sup.Add(myDB, samsara.WithTier(samsara.TierCritical))
+//	sup.Add(myCache, samsara.WithTier(samsara.TierSignificant))
 //
-//	app := frame.NewApplication(
-//	    frame.WithSupervisor(sup),
-//	    frame.WithMainFunc(server.Run),
-//	    frame.WithShutdownTimeout(20*time.Second),
+//	app := samsara.NewApplication(
+//	    samsara.WithSupervisor(sup),
+//	    samsara.WithMainFunc(server.Run),
+//	    samsara.WithShutdownTimeout(20*time.Second),
 //	)
 //	if err := app.Run(); err != nil {
 //	    log.Fatal(err)
