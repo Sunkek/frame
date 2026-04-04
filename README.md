@@ -1,5 +1,9 @@
 # samsara
 
+[![CI](https://github.com/Sunkek/samsara/actions/workflows/ci.yml/badge.svg)](https://github.com/Sunkek/samsara/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/sunkek/samsara.svg)](https://pkg.go.dev/github.com/sunkek/samsara)
+[![Go Report Card](https://goreportcard.com/badge/github.com/sunkek/samsara)](https://goreportcard.com/report/github.com/sunkek/samsara)
+
 A small, explicit lifecycle runtime for Go services — zero external dependencies.
 
 The name comes from the concept of cyclical existence: components fail, are restarted, and return to service. `samsara` makes that cycle explicit, controlled, and observable — rather than something that happens ad hoc in `main.go`.

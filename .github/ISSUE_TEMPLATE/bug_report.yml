@@ -1,0 +1,53 @@
+name: Bug report
+description: Something is not working correctly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out the sections below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: The smallest possible code that demonstrates the problem.
+      render: go
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Actual output or error
+      render: text
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      placeholder: "go version go1.22.0 linux/amd64"
+    validations:
+      required: true
+
+  - type: input
+    id: samsara-version
+    attributes:
+      label: samsara version
+      placeholder: "v0.4.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / architecture
+      placeholder: "linux/amd64, darwin/arm64, …"
