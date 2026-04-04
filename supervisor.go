@@ -33,10 +33,10 @@ func (h *healthStatus) incRestarts() {
 	h.mu.Unlock()
 }
 
-func (h *healthStatus) get() (err error, present bool, restartCount int) {
+func (h *healthStatus) get() (present bool, restartCount int, err error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.err, h.present, h.restartCount
+	return h.present, h.restartCount, h.err
 }
 
 // SupervisorOption configures a Supervisor.
@@ -179,7 +179,7 @@ func (s *Supervisor) ComponentHealth(name string) (err error, known bool) {
 	if !ok {
 		return nil, false
 	}
-	err, known, _ = hs.get()
+	known, _, err = hs.get()
 	return
 }
 
@@ -193,7 +193,7 @@ func (s *Supervisor) HealthReport() map[string]ComponentStatus {
 	}
 	out := make(map[string]ComponentStatus, len(statuses))
 	for name, hs := range statuses {
-		err, known, restarts := hs.get()
+		known, restarts, err := hs.get()
 		out[name] = ComponentStatus{Err: err, Known: known, Tier: hs.tier, RestartCount: restarts}
 	}
 	return out
@@ -209,7 +209,7 @@ func (s *Supervisor) HealthReportOrdered() []NamedComponentStatus {
 	}
 	out := make([]NamedComponentStatus, 0, len(statuses))
 	for name, hs := range statuses {
-		err, known, restarts := hs.get()
+		known, restarts, err := hs.get()
 		out = append(out, NamedComponentStatus{
 			Name:            name,
 			ComponentStatus: ComponentStatus{Err: err, Known: known, Tier: hs.tier, RestartCount: restarts},
