@@ -520,7 +520,6 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 			}
 
 			startedAt = time.Now()
-			wasUnhealthy = false
 			attempt++
 		}
 	}
