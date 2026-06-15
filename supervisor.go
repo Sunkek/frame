@@ -51,6 +51,7 @@ type supervisorConfig struct {
 	logger             Logger
 	hooks              *EventHooks
 	metrics            MetricsObserver
+	parallel           bool
 }
 
 // WithHealthInterval sets how often the supervisor polls each component's
@@ -90,6 +91,20 @@ func WithMetricsObserver(m MetricsObserver) SupervisorOption {
 	return func(c *supervisorConfig) { c.metrics = m }
 }
 
+// WithParallelStartStop enables concurrent startup and shutdown of components
+// that have no dependency relationship.
+//
+// By default the supervisor starts components strictly sequentially in
+// registration order and stops them in exact reverse order. With this option,
+// the only ordering constraint is the dependency graph declared via
+// WithDependencies: a component starts as soon as all of its dependencies have
+// signalled ready(), and stops only after all of its dependents have stopped.
+// Components with no edge between them start and stop concurrently, so their
+// relative order is no longer deterministic.
+func WithParallelStartStop() SupervisorOption {
+	return func(c *supervisorConfig) { c.parallel = true }
+}
+
 // Supervisor starts, monitors, and stops a set of Components in dependency
 // order. Components are started sequentially (dependencies first) and stopped
 // in reverse order (dependents first).
@@ -110,6 +125,7 @@ type Supervisor struct {
 	running  int32
 	statusMu sync.RWMutex
 	statuses map[string]*healthStatus
+	parallel bool
 }
 
 // NewSupervisor constructs a Supervisor with the given options.
@@ -137,6 +153,7 @@ func NewSupervisor(opts ...SupervisorOption) *Supervisor {
 		logger:             cfg.logger,
 		hooks:              cfg.hooks,
 		metrics:            cfg.metrics,
+		parallel:           cfg.parallel,
 	}
 }
 
@@ -254,6 +271,16 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
+	if s.parallel {
+		return s.runParallel(ctx, cancel, ordered)
+	}
+	return s.runSequential(ctx, cancel, ordered)
+}
+
+// runSequential starts components one at a time in dependency order, waiting
+// for each to become ready before starting the next, and stops them in exact
+// reverse order. This is the default behaviour.
+func (s *Supervisor) runSequential(ctx context.Context, cancel context.CancelCauseFunc, ordered []*managedComponent) error {
 	started := make([]*managedComponent, 0, len(ordered))
 	criticalErrCh := make(chan error, len(ordered))
 	var wg sync.WaitGroup
@@ -297,9 +324,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
+	s.stopAll(started)
 	wg.Wait()
 	close(criticalErrCh)
-	s.stopAll(started)
 
 	for err := range criticalErrCh {
 		if err != nil {
@@ -314,6 +341,133 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		return cause
 	}
 	return nil
+}
+
+// runParallel starts components concurrently, constrained only by the
+// dependency graph: each component waits for all of its dependencies to signal
+// ready() before its own Start is attempted. On shutdown, each component waits
+// for all of its dependents to finish stopping before it is stopped. Components
+// with no edge between them run concurrently.
+func (s *Supervisor) runParallel(ctx context.Context, cancel context.CancelCauseFunc, ordered []*managedComponent) error {
+	criticalErrCh := make(chan error, len(ordered))
+
+	// One ready channel per component, closed when that component has signalled
+	// ready(). Built once before any goroutine starts so reads need no lock.
+	readyChs := make(map[string]chan struct{}, len(ordered))
+	for _, mc := range ordered {
+		readyChs[mc.component.Name()] = make(chan struct{})
+	}
+
+	var (
+		lifeWg    sync.WaitGroup // tracks each component's full lifetime goroutine
+		startWg   sync.WaitGroup // tracks completion of the startup phase only
+		startedMu sync.Mutex
+		started   = make([]*managedComponent, 0, len(ordered))
+	)
+
+	for _, mc := range ordered {
+		name := mc.component.Name()
+
+		lifeWg.Add(1)
+		startWg.Add(1)
+		go func() {
+			defer lifeWg.Done()
+
+			// Wait for every dependency to become ready, or abort on shutdown.
+			for _, dep := range mc.deps {
+				select {
+				case <-readyChs[dep]:
+				case <-ctx.Done():
+					startWg.Done()
+					return
+				}
+			}
+			if ctx.Err() != nil {
+				startWg.Done()
+				return
+			}
+
+			if err := s.startOne(ctx, mc); err != nil {
+				criticalErrCh <- err
+				cancel(err)
+				startWg.Done()
+				return
+			}
+			// startOne returned nil: either the component signalled ready, or ctx
+			// was cancelled mid-start. In both cases its Start goroutine is live
+			// and must be stopped, so register it (Stop is idempotent). This
+			// mirrors the sequential path, which also adds in-flight components.
+			startedMu.Lock()
+			started = append(started, mc)
+			startedMu.Unlock()
+			close(readyChs[name]) // unblock dependents
+			startWg.Done()
+
+			if err := s.manage(ctx, mc, cancel); err != nil {
+				criticalErrCh <- err
+				cancel(err)
+			}
+		}()
+	}
+
+	<-ctx.Done()
+
+	// Let the startup phase settle so the started set is stable before we stop.
+	startWg.Wait()
+	s.stopAllParallel(started)
+	lifeWg.Wait()
+	close(criticalErrCh)
+
+	for err := range criticalErrCh {
+		if err != nil {
+			return err
+		}
+	}
+	if cause := context.Cause(ctx); cause != nil && !isContextError(ctx.Err()) {
+		return cause
+	}
+	return nil
+}
+
+// stopAllParallel stops every started component concurrently, ensuring a
+// component is stopped only after all of its (started) dependents have stopped.
+func (s *Supervisor) stopAllParallel(started []*managedComponent) {
+	startedSet := make(map[string]bool, len(started))
+	for _, mc := range started {
+		startedSet[mc.component.Name()] = true
+	}
+
+	// dependents[x] = started components that declared x as a dependency.
+	dependents := make(map[string][]string, len(started))
+	for _, mc := range started {
+		for _, dep := range mc.deps {
+			if startedSet[dep] {
+				dependents[dep] = append(dependents[dep], mc.component.Name())
+			}
+		}
+	}
+
+	stoppedChs := make(map[string]chan struct{}, len(started))
+	for _, mc := range started {
+		stoppedChs[mc.component.Name()] = make(chan struct{})
+	}
+
+	var wg sync.WaitGroup
+	for _, mc := range started {
+		name := mc.component.Name()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Wait for all dependents to stop before stopping this component.
+			for _, dep := range dependents[name] {
+				<-stoppedChs[dep]
+			}
+			err := s.doStop(mc)
+			s.metrics.ComponentStopped(name, err)
+			close(stoppedChs[name])
+		}()
+	}
+	wg.Wait()
 }
 
 // launch starts a component's goroutine. Returns:
@@ -425,9 +579,6 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 		s.metrics.ComponentRestarting(name, startErr, attempt+1, delay)
 		s.logger.Info("component will restart",
 			"component", name, "delay", delay, "next_attempt", attempt+1)
-		if hs, ok := s.statuses[name]; ok {
-			hs.incRestarts()
-		}
 
 		select {
 		case <-ctx.Done():

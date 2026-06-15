@@ -11,6 +11,18 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.0] — 2026-06-15
+
+### Added
+- `WithParallelStartStop` supervisor option. When enabled, components start and
+  stop concurrently, constrained only by the dependency graph declared via
+  `WithDependencies`: a component starts once all its dependencies have signalled
+  `ready()`, and stops only after all its dependents have stopped. Components
+  with no edge between them run concurrently. The default remains strictly
+  sequential startup in registration order with exact reverse-order shutdown.
+
+---
+
 ## [0.4.0] — 2026-04-04
 
 ### Changed
@@ -108,7 +120,8 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Logger` interface compatible with `*slog.Logger`.
 - Zero external dependencies.
 
-[Unreleased]: https://github.com/sunkek/samsara/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/sunkek/samsara/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/sunkek/samsara/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sunkek/samsara/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/sunkek/samsara/compare/v0.3.0...v0.3.3
 [0.3.0]: https://github.com/sunkek/samsara/compare/v0.2.0...v0.3.0

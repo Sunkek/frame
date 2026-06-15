@@ -451,6 +451,7 @@ samsara.WithHealthLogger(slog.Default())
 | `WithSupervisorLogger` | nop | Structured logger |
 | `WithEventHooks` | nil | Lifecycle event callbacks |
 | `WithMetricsObserver` | nop | Telemetry receiver |
+| `WithParallelStartStop` | off | Start/stop components concurrently, constrained only by the dependency graph |
 
 ### Application
 
