@@ -11,6 +11,24 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.1] — 2026-07-09
+
+### Fixed
+- `Application.Run` no longer closes the internal error channel during shutdown.
+  On the shutdown-timeout path the main and supervisor goroutines can still be
+  alive and send an error after `Run` proceeds; closing the channel turned that
+  late send into a send-on-closed-channel panic. Errors are now drained
+  non-blockingly (the channel is buffered to its sender count).
+- `ExponentialBackoff` now caps its pre-jitter delay at 1 hour. Previously
+  `baseDelay << attempt` overflowed the int64 nanosecond duration at high
+  attempt counts, wrapping to a negative/zero delay and spinning a hot restart
+  loop. The delay stays positive and bounded regardless of attempt count.
+- `Supervisor` restart-wait branches use an explicit stopped timer instead of
+  `time.After`, so a context cancellation during the restart delay no longer
+  leaks a pending timer until it fires.
+
+---
+
 ## [0.5.0] — 2026-06-15
 
 ### Added

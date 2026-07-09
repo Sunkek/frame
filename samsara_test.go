@@ -163,6 +163,29 @@ func TestExponentialBackoff(t *testing.T) {
 	}
 }
 
+// TestExponentialBackoffOverflow guards the int64 shift: at high attempt counts
+// base<<attempt overflows to a negative (or zero) duration, which would return
+// an immediate-restart delay and spin a hot loop. The delay must instead clamp
+// to a positive, bounded value.
+func TestExponentialBackoffOverflow(t *testing.T) {
+	// maxRetries large enough that ShouldRestart evaluates the delay (not the
+	// attempt >= max short-circuit) at attempts that overflow the shift.
+	p := samsara.ExponentialBackoff(1_000, time.Second)
+	for _, attempt := range []int{40, 62, 63, 64, 100, 512} {
+		restart, got := p.ShouldRestart(errFake, attempt)
+		if !restart {
+			t.Fatalf("attempt %d: should still restart below max retries", attempt)
+		}
+		if got <= 0 {
+			t.Fatalf("attempt %d: delay %v must stay positive (overflow guard)", attempt, got)
+		}
+		// Capped at maxBackoff (1h) + up to 25% jitter.
+		if hi := time.Duration(float64(time.Hour) * 1.25); got > hi {
+			t.Fatalf("attempt %d: delay %v exceeds capped ceiling %v", attempt, got, hi)
+		}
+	}
+}
+
 // ── Supervisor: basic lifecycle ───────────────────────────────────────────────
 
 func TestSupervisor_StartsAndStops(t *testing.T) {

@@ -193,7 +193,7 @@ Recovery is automatic: if a restarted component calls `ready()` and health check
 samsara.NeverRestart()                         // fail once → permanent (default)
 samsara.AlwaysRestart(2*time.Second)           // retry forever, fixed delay
 samsara.MaxRetries(5, time.Second)             // up to 5 retries, fixed delay
-samsara.ExponentialBackoff(5, time.Second)     // 1s, 2s, 4s, 8s, 16s (±25% jitter)
+samsara.ExponentialBackoff(5, time.Second)     // 1s, 2s, 4s, 8s, 16s (±25% jitter; capped at 1h)
 ```
 
 The attempt counter resets to zero if the component runs without fault for longer than `WithRestartResetWindow` (default 5 minutes).

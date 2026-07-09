@@ -580,11 +580,24 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) error {
 		s.logger.Info("component will restart",
 			"component", name, "delay", delay, "next_attempt", attempt+1)
 
-		select {
-		case <-ctx.Done():
+		if !sleepCtx(ctx, delay) {
 			return nil
-		case <-time.After(delay):
 		}
+	}
+}
+
+// sleepCtx waits for d or until ctx is cancelled, reporting true if the full
+// delay elapsed and false if ctx was cancelled first. It uses an explicit timer
+// (stopped on the cancel path) so the ctx-cancel branch does not leak a pending
+// time.After timer until it fires.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -659,10 +672,8 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 				"component", name, "delay", delay, "next_attempt", attempt+1)
 			s.statuses[name].incRestarts()
 
-			select {
-			case <-ctx.Done():
+			if !sleepCtx(ctx, delay) {
 				return nil
-			case <-time.After(delay):
 			}
 
 			if err := s.startOne(ctx, mc); err != nil {

@@ -217,11 +217,21 @@ func (a *Application) Run() error {
 		timeoutErr = ErrShutdownTimeout
 	}
 
-	close(errCh)
-
+	// Drain errCh without closing it. On the timeout path the main and
+	// supervisor goroutines may still be alive and could send after we return;
+	// closing here would turn that late send into a send-on-closed-channel
+	// panic during shutdown. errCh is buffered to cap(errCh) with at most that
+	// many senders, so every send fits the buffer and a non-blocking drain
+	// collects all errors already reported.
 	var errs []error
-	for err := range errCh {
-		errs = append(errs, err)
+	for i := 0; i < cap(errCh); i++ {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				errs = append(errs, err)
+			}
+		default:
+		}
 	}
 	if timeoutErr != nil {
 		errs = append(errs, timeoutErr)

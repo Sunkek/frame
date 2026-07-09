@@ -60,6 +60,11 @@ func (p maxRetriesPolicy) ShouldRestart(_ error, attempt int) (bool, time.Durati
 //	attempt 0: baseDelay  × [0.75, 1.25)
 //	attempt 1: 2×baseDelay × [0.75, 1.25)
 //	attempt 2: 4×baseDelay × [0.75, 1.25)  …and so on
+//
+// The doubling is capped at maxBackoff so a large attempt count cannot overflow
+// the int64 delay (base<<attempt wraps negative past ~63 shifts); once the cap
+// is reached the delay stays flat (plus jitter) rather than exploding or
+// collapsing to zero.
 func ExponentialBackoff(maxRetries int, baseDelay time.Duration) RestartPolicy {
 	return exponentialBackoff{max: maxRetries, base: baseDelay}
 }
@@ -69,11 +74,22 @@ type exponentialBackoff struct {
 	base time.Duration
 }
 
+// maxBackoff caps the pre-jitter delay so unbounded doubling can't overflow the
+// int64 nanosecond duration into a negative (immediate-restart) value.
+const maxBackoff = time.Hour
+
 func (p exponentialBackoff) ShouldRestart(_ error, attempt int) (bool, time.Duration) {
 	if attempt >= p.max {
 		return false, 0
 	}
-	base := p.base * (1 << attempt)
+	base := maxBackoff
+	// 62 shifts is the last that stays within int64; beyond it, and whenever the
+	// shifted value overflows or exceeds the cap, clamp to maxBackoff.
+	if attempt < 62 {
+		if shifted := p.base << uint(attempt); shifted > 0 && shifted <= maxBackoff {
+			base = shifted
+		}
+	}
 	jitter := time.Duration(float64(base) * (0.75 + rand.Float64()*0.5))
 	return true, jitter
 }
