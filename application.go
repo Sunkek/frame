@@ -72,8 +72,10 @@ type Application struct {
 	shutdownTimeout time.Duration
 	logger          Logger
 
-	mu         sync.Mutex
-	cancelRoot context.CancelCauseFunc
+	mu              sync.Mutex
+	cancelRoot      context.CancelCauseFunc
+	pendingShutdown bool  // Shutdown was called before Run wired cancelRoot
+	pendingCause    error // cause recorded by a pre-Run Shutdown
 }
 
 // NewApplication constructs an Application with the supplied options.
@@ -106,11 +108,19 @@ func isContextError(err error) bool {
 // shutdown. The optional cause is attached to the context so that components
 // and the main function can inspect it via context.Cause if needed.
 //
-// It is safe to call from any goroutine. Calling Shutdown before Run is a
-// no-op. Calling it multiple times is safe; only the first cause is recorded.
+// It is safe to call from any goroutine. Calling Shutdown before Run records
+// the request: the subsequent Run starts and then immediately begins a graceful
+// shutdown with the recorded cause, rather than silently ignoring the call.
+// Calling it multiple times is safe; only the first cause is recorded.
 func (a *Application) Shutdown(cause error) {
 	a.mu.Lock()
 	cancel := a.cancelRoot
+	if cancel == nil && !a.pendingShutdown {
+		// Run has not wired the root context yet — remember the request so Run
+		// can honour it as soon as it starts.
+		a.pendingShutdown = true
+		a.pendingCause = cause
+	}
 	a.mu.Unlock()
 	if cancel != nil {
 		cancel(cause)
@@ -155,9 +165,17 @@ func (a *Application) Run() error {
 
 	a.mu.Lock()
 	a.cancelRoot = cancelRoot
+	pending, pendingCause := a.pendingShutdown, a.pendingCause
 	a.mu.Unlock()
 
 	a.logger.Info("application starting")
+
+	// A Shutdown call that arrived before Run wired the context is honoured now:
+	// start normally, then trigger graceful shutdown immediately.
+	if pending {
+		a.logger.Info("shutdown requested before run — shutting down immediately")
+		cancelRoot(pendingCause)
+	}
 
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
