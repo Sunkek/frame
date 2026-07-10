@@ -163,6 +163,9 @@ func (a *Application) Run() error {
 	var wg sync.WaitGroup
 
 	if a.supervisor != nil {
+		// Bound the supervisor's total shutdown work by the application's
+		// shutdown budget (A3) unless the caller set an explicit grace.
+		a.supervisor.setDefaultShutdownGrace(a.shutdownTimeout)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -20,6 +20,15 @@ type HealthReporter interface {
 	HealthReportOrdered() []NamedComponentStatus
 }
 
+// LivenessReporter is an optional extension of HealthReporter. When the
+// reporter passed to a HealthServer also implements it, /livez fails (503) once
+// Alive returns false — i.e. once the supervisor has entered a failure-driven
+// shutdown. *Supervisor satisfies this via Alive(). Without it, /livez reflects
+// only whether the health port is bound.
+type LivenessReporter interface {
+	Alive() bool
+}
+
 // HealthServerOption configures a HealthServer.
 type HealthServerOption func(*healthServerConfig)
 
@@ -57,7 +66,8 @@ func WithHealthLogger(l Logger) HealthServerOption {
 
 // HealthServer is a Component that exposes three HTTP endpoints:
 //
-//	GET /livez   — liveness:  200 while the process is alive
+//	GET /livez   — liveness:  200 while the process is alive and the supervisor
+//	               has not entered a failure-driven shutdown (see LivenessReporter)
 //	GET /readyz  — readiness: 200 if all Critical/Significant components healthy
 //	GET /healthz — alias for /readyz (Docker HEALTHCHECK compatibility)
 //
@@ -66,6 +76,7 @@ func WithHealthLogger(l Logger) HealthServerOption {
 type HealthServer struct {
 	name     string
 	reporter HealthReporter
+	liveness LivenessReporter // non-nil if reporter also implements LivenessReporter
 	addr     string
 	server   *http.Server
 	logger   Logger
@@ -93,6 +104,9 @@ func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *Healt
 		reporter: reporter,
 		addr:     cfg.addr,
 		logger:   cfg.logger,
+	}
+	if lr, ok := reporter.(LivenessReporter); ok {
+		hs.liveness = lr
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", hs.handleLivez)
@@ -144,6 +158,11 @@ func (h *HealthServer) handleLivez(w http.ResponseWriter, _ *http.Request) {
 	h.mu.RLock()
 	alive := h.alive
 	h.mu.RUnlock()
+	// Beyond "port is bound", fail liveness when the supervisor reports it is no
+	// longer alive (a Critical/Significant component failed permanently).
+	if alive && h.liveness != nil && !h.liveness.Alive() {
+		alive = false
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if alive {
 		w.WriteHeader(http.StatusOK)
