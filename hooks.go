@@ -25,6 +25,20 @@ type EventHooks struct {
 	// for a component. It receives the component name, the triggering error,
 	// and the attempt number (1-based).
 	OnRestart func(component string, err error, attempt int)
+
+	// OnReady is called each time a component signals ready() and the supervisor
+	// considers it running — on first start and after every successful restart.
+	// Use it to flip a load-balancer probe or emit lifecycle telemetry.
+	OnReady func(component string)
+
+	// BeforeStop is called immediately before the supervisor invokes a
+	// component's Stop, whether for a restart or during shutdown. This is the
+	// hook to begin draining in-flight work or deregister from a load balancer.
+	BeforeStop func(component string)
+
+	// OnStopped is called immediately after a component's Stop returns. It
+	// receives the component name and the error Stop returned (nil on success).
+	OnStopped func(component string, err error)
 }
 
 func (h *EventHooks) fireUnhealthy(component string, err error) {
@@ -48,5 +62,23 @@ func (h *EventHooks) fireFailed(component string, err error) {
 func (h *EventHooks) fireRestart(component string, err error, attempt int) {
 	if h != nil && h.OnRestart != nil {
 		h.OnRestart(component, err, attempt)
+	}
+}
+
+func (h *EventHooks) fireReady(component string) {
+	if h != nil && h.OnReady != nil {
+		h.OnReady(component)
+	}
+}
+
+func (h *EventHooks) fireBeforeStop(component string) {
+	if h != nil && h.BeforeStop != nil {
+		h.BeforeStop(component)
+	}
+}
+
+func (h *EventHooks) fireStopped(component string, err error) {
+	if h != nil && h.OnStopped != nil {
+		h.OnStopped(component, err)
 	}
 }

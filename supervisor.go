@@ -3,6 +3,7 @@ package samsara
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -221,10 +222,15 @@ func (s *Supervisor) Add(c Component, opts ...ComponentOption) {
 		panic(fmt.Errorf("%w: %s", ErrComponentAlreadyRegistered, name))
 	}
 	s.components[name] = &managedComponent{
-		component:     c,
-		tier:          cfg.tier,
-		restartPolicy: cfg.restartPolicy,
-		deps:          cfg.deps,
+		component:        c,
+		tier:             cfg.tier,
+		restartPolicy:    cfg.restartPolicy,
+		deps:             cfg.deps,
+		healthInterval:   cfg.healthInterval,
+		healthTimeout:    cfg.healthTimeout,
+		failThreshold:    cfg.failThreshold,
+		recoverThreshold: cfg.recoverThreshold,
+		healthJitter:     cfg.healthJitter,
 	}
 	s.insertionOrder = append(s.insertionOrder, name)
 }
@@ -615,6 +621,7 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) (<-chan
 			// can watch for an unexpected exit after ready().
 			s.logger.Info("component started", "component", name)
 			s.metrics.ComponentStarted(name, attempt)
+			s.hooks.fireReady(name)
 			return startExit, nil
 		}
 
@@ -652,6 +659,20 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// jittered returns d perturbed by ±fraction of its value, spreading health
+// probes across components and instances. fraction is clamped to [0, 1]; a
+// non-positive fraction returns d unchanged.
+func jittered(d time.Duration, fraction float64) time.Duration {
+	if fraction <= 0 || d <= 0 {
+		return d
+	}
+	if fraction > 1 {
+		fraction = 1
+	}
+	delta := float64(d) * fraction * (2*rand.Float64() - 1)
+	return d + time.Duration(delta)
+}
+
 // manage runs the ongoing health-check loop for a running component.
 // It accesses s.statuses[name] directly (without statusMu) because the map
 // is written exactly once in Run() before any goroutine starts, and is never
@@ -674,14 +695,37 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 	// Component is running and considered healthy until proven otherwise.
 	s.statuses[name].set(nil)
 
-	var tickC <-chan time.Time
-	if hasHealth {
-		ticker := time.NewTicker(s.healthInterval)
-		defer ticker.Stop()
-		tickC = ticker.C
+	// Resolve per-component health tuning, falling back to supervisor defaults.
+	interval := mc.healthInterval
+	if interval <= 0 {
+		interval = s.healthInterval
+	}
+	hTimeout := mc.healthTimeout
+	if hTimeout <= 0 {
+		hTimeout = s.healthTimeout
+	}
+	failThreshold := mc.failThreshold
+	if failThreshold < 1 {
+		failThreshold = 1
+	}
+	recoverThreshold := mc.recoverThreshold
+	if recoverThreshold < 1 {
+		recoverThreshold = 1
 	}
 
-	wasUnhealthy := false
+	var (
+		timer  *time.Timer
+		timerC <-chan time.Time
+	)
+	if hasHealth {
+		timer = time.NewTimer(jittered(interval, mc.healthJitter))
+		defer timer.Stop()
+		timerC = timer.C
+	}
+
+	unhealthy := false // confirmed-unhealthy state (threshold breached)
+	failCount := 0     // consecutive failed probes
+	okCount := 0       // consecutive healthy probes while unhealthy
 	attempt := 0
 	startedAt := time.Now()
 
@@ -694,7 +738,6 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 		s.statuses[name].set(fErr)
 		s.logger.Error("component unhealthy", "component", name, "error", fErr)
 		s.hooks.fireUnhealthy(name, fErr)
-		wasUnhealthy = true
 
 		if time.Since(startedAt) > s.restartResetWindow {
 			attempt = 0
@@ -759,28 +802,54 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 				return termErr
 			}
 
-		case <-tickC:
+		case <-timerC:
+			// Schedule the next probe up front so the cadence holds regardless of
+			// which branch below is taken (transient, recovery, or restart).
+			timer.Reset(jittered(interval, mc.healthJitter))
+
 			t0 := time.Now()
-			hCtx, hCancel := context.WithTimeout(ctx, s.healthTimeout)
+			hCtx, hCancel := context.WithTimeout(ctx, hTimeout)
 			hErr := hc.Health(hCtx)
 			hCancel()
 			duration := time.Since(t0)
 
-			s.statuses[name].set(hErr)
+			// Report every raw probe for observability, but only let the
+			// *confirmed* state (after threshold) drive status and restarts.
 			s.metrics.HealthCheckCompleted(name, duration, hErr)
 
 			if hErr == nil {
-				if wasUnhealthy {
-					wasUnhealthy = false
-					s.logger.Info("component recovered", "component", name)
-					s.hooks.fireRecovered(name)
+				failCount = 0
+				if unhealthy {
+					okCount++
+					if okCount >= recoverThreshold {
+						unhealthy = false
+						okCount = 0
+						s.statuses[name].set(nil)
+						s.logger.Info("component recovered", "component", name)
+						s.hooks.fireRecovered(name)
+					}
 				}
 				continue
 			}
 
+			okCount = 0
+			failCount++
+			if failCount < failThreshold {
+				// Transient blip: below threshold, do not flip readiness or restart.
+				s.logger.Debug("component health probe failed (below threshold)",
+					"component", name, "error", hErr, "fails", failCount, "threshold", failThreshold)
+				continue
+			}
+
+			// Threshold breached — a confirmed fault.
+			failCount = 0
+			unhealthy = true
 			if termErr, done := onFault(hErr); done {
 				return termErr
 			}
+			// Restarted: the component is fresh again. Keep unhealthy=true so a
+			// sustained recovery still fires OnRecovered.
+			okCount = 0
 		}
 	}
 }
@@ -832,9 +901,12 @@ func (s *Supervisor) stopBudget() (budget time.Duration, ok bool) {
 	return budget, true
 }
 
-func (s *Supervisor) doStop(mc *managedComponent) error {
+func (s *Supervisor) doStop(mc *managedComponent) (err error) {
 	name := mc.component.Name()
 	s.logger.Info("component stopping", "component", name)
+	s.hooks.fireBeforeStop(name)
+	defer func() { s.hooks.fireStopped(name, err) }()
+
 	budget, ok := s.stopBudget()
 	if !ok {
 		// Overall shutdown deadline exceeded: abandon this Stop with an
@@ -843,7 +915,7 @@ func (s *Supervisor) doStop(mc *managedComponent) error {
 		s.logger.Error("shutdown deadline exceeded — abandoning stop", "component", name)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		err := mc.component.Stop(ctx)
+		err = mc.component.Stop(ctx)
 		if err != nil {
 			s.logger.Error("component stop error", "component", name, "error", err)
 		}
@@ -851,7 +923,7 @@ func (s *Supervisor) doStop(mc *managedComponent) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	err := mc.component.Stop(ctx)
+	err = mc.component.Stop(ctx)
 	if err != nil {
 		s.logger.Error("component stop error", "component", name, "error", err)
 	} else {

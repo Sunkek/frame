@@ -3,6 +3,7 @@ package samsara
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // Tier expresses how important a component is to overall application health.
@@ -113,6 +114,12 @@ type componentConfig struct {
 	tier          Tier
 	restartPolicy RestartPolicy
 	deps          []string
+
+	healthInterval   time.Duration // 0 = use supervisor default
+	healthTimeout    time.Duration // 0 = use supervisor default
+	failThreshold    int           // consecutive failures before unhealthy; 0/1 = act immediately
+	recoverThreshold int           // consecutive successes before recovered; 0/1 = act immediately
+	healthJitter     float64       // ±fraction applied to the interval; 0 = none
 }
 
 // WithTier sets the importance tier of a component. Defaults to TierCritical.
@@ -132,10 +139,48 @@ func WithDependencies(names ...string) ComponentOption {
 	return func(c *componentConfig) { c.deps = append(c.deps, names...) }
 }
 
+// WithComponentHealthInterval overrides the supervisor's global health-poll
+// interval for this component. Zero (the default) uses the supervisor value.
+func WithComponentHealthInterval(d time.Duration) ComponentOption {
+	return func(c *componentConfig) { c.healthInterval = d }
+}
+
+// WithComponentHealthTimeout overrides the supervisor's global per-probe Health
+// timeout for this component. Zero (the default) uses the supervisor value.
+func WithComponentHealthTimeout(d time.Duration) ComponentOption {
+	return func(c *componentConfig) { c.healthTimeout = d }
+}
+
+// WithHealthThreshold sets how many consecutive failed Health probes mark the
+// component unhealthy (fail), and how many consecutive successes mark it
+// recovered again (recover). This debounces transient blips: a single failed
+// probe no longer flips /readyz or triggers a restart. Values < 1 are treated
+// as 1 (act on the first probe, the historical behaviour).
+func WithHealthThreshold(fail, recover int) ComponentOption {
+	return func(c *componentConfig) {
+		c.failThreshold = fail
+		c.recoverThreshold = recover
+	}
+}
+
+// WithHealthJitter applies a random ±fraction to this component's health-poll
+// interval, de-synchronising probes across components and instances. fraction
+// is clamped to [0, 1]; 0 (the default) disables jitter. E.g. 0.1 spreads a 10s
+// interval over [9s, 11s].
+func WithHealthJitter(fraction float64) ComponentOption {
+	return func(c *componentConfig) { c.healthJitter = fraction }
+}
+
 // managedComponent pairs a Component with its supervisor metadata.
 type managedComponent struct {
 	component     Component
 	tier          Tier
 	restartPolicy RestartPolicy
 	deps          []string
+
+	healthInterval   time.Duration
+	healthTimeout    time.Duration
+	failThreshold    int
+	recoverThreshold int
+	healthJitter     float64
 }
