@@ -1,8 +1,8 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository is a single-package Go module (`github.com/sunkek/samsara`) with source files at the repository root (for example, `application.go`, `supervisor.go`, `health_server.go`).  
-Tests currently live in `samsara_test.go`; add new tests as `*_test.go` files in the same package.  
+This repository is a Go module (`github.com/sunkek/samsara`) whose core is a single package with source files at the repository root (for example, `application.go`, `supervisor.go`, `health_server.go`), plus a stdlib-only `testutil/` subpackage of test fakes.  
+Tests live in `samsara_test.go` and topic files (`tier_a_test.go`, `tier_b_test.go`, `tier_c_test.go`, `parallel_test.go`, `example_test.go`); add new tests as `*_test.go` files.  
 Project metadata and contributor docs are also at root: `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `SECURITY.md`. CI config is in `.github/workflows/ci.yml`.
 
 ## Build, Test, and Development Commands

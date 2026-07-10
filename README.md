@@ -218,6 +218,28 @@ type HealthChecker interface {
 
 The supervisor calls `Health` every `WithHealthInterval` (default 10s). A non-nil result triggers the tier logic above. Health checks are bounded by `WithHealthTimeout` (default 5s).
 
+### Per-component tuning
+
+Health behaviour can be overridden per component at registration:
+
+```go
+sup.Add(cache,
+    samsara.WithComponentHealthInterval(2*time.Second), // override global interval
+    samsara.WithComponentHealthTimeout(500*time.Millisecond),
+    samsara.WithHealthThreshold(3, 1), // unhealthy after 3 consecutive fails; recovered after 1 ok
+    samsara.WithHealthJitter(0.1),     // ±10% jitter to de-synchronise probes
+)
+```
+
+`WithHealthThreshold` debounces transient blips: below the fail threshold a
+failed probe does **not** flip `/readyz` or trigger a restart. Defaults
+(threshold `1`, no jitter, global interval/timeout) preserve the original
+behaviour.
+
+Post-`ready()` crashes are also supervised: a component whose `Start` returns
+unexpectedly after signalling ready — even one without a `HealthChecker` — is
+subject to its restart policy and tier, not silently lost.
+
 ---
 
 ## Health endpoints
@@ -226,7 +248,7 @@ The supervisor calls `Health` every `WithHealthInterval` (default 10s). A non-ni
 
 | Endpoint | 200 when | Use for |
 |---|---|---|
-| `GET /livez` | Process is alive | Kubernetes `livenessProbe` |
+| `GET /livez` | Process is alive **and** the supervisor has not entered a failure-driven shutdown | Kubernetes `livenessProbe` |
 | `GET /readyz` | All Critical + Significant components healthy | Kubernetes `readinessProbe` |
 | `GET /healthz` | Same as `/readyz` | Docker `HEALTHCHECK` |
 
@@ -235,6 +257,8 @@ The supervisor calls `Health` every `WithHealthInterval` (default 10s). A non-ni
 **`/readyz` flips during shutdown** — the HealthServer stops last, so it returns 503 as soon as shutdown begins, before any other component stops. This drains load balancer connections cleanly.
 
 **Recovery** — if a degraded component recovers, `/readyz` returns 200 again automatically.
+
+**`/livez` is supervision-aware** — beyond "the port is bound," it returns 503 once a Critical or Significant component fails permanently and the supervisor begins a failure-driven shutdown (`Supervisor.Alive()` via the `LivenessReporter` interface). A wedged/crashed critical component surfaces on liveness, not just readiness.
 
 `/readyz` response body:
 ```json
@@ -414,6 +438,40 @@ type MetricsObserver interface {
 
 ---
 
+## Lifecycle hooks
+
+`EventHooks` (via `WithEventHooks`) fires synchronous callbacks on lifecycle
+events. All are optional; each **must not block** (enqueue or spawn a goroutine
+for slow work).
+
+| Hook | Fired when |
+|---|---|
+| `OnReady(name)` | Component signalled `ready()` — on first start and every successful restart |
+| `BeforeStop(name)` | Immediately before `Stop` is called (drain in-flight work, deregister from LB) |
+| `OnStopped(name, err)` | Immediately after `Stop` returns |
+| `OnUnhealthy(name, err)` | A health probe (or post-ready exit) is confirmed a fault |
+| `OnRecovered(name)` | A previously-unhealthy component is healthy again |
+| `OnRestart(name, err, attempt)` | A restart attempt is scheduled |
+| `OnFailed(name, err)` | Component failed permanently (restart policy exhausted / `NeverRestart`) |
+
+---
+
+## Testing
+
+The `samsara/testutil` package exports a configurable `FakeComponent`
+(implements `Component` + `HealthChecker`) so tests need not hand-roll stubs:
+
+```go
+f := testutil.NewFakeComponent("db",
+    testutil.WithReadyDelay(10*time.Millisecond),
+)
+sup.Add(f, samsara.WithTier(samsara.TierAuxiliary))
+// ... f.WaitReady(timeout); f.SetHealthError(err); f.Crash(err)
+// counters: f.StartCount() / f.StopCount() / f.HealthCount()
+```
+
+---
+
 ## Programmatic shutdown
 
 ```go
@@ -422,6 +480,9 @@ app.Shutdown(errors.New("config reload required"))
 ```
 
 `app.Shutdown(nil)` is a clean shutdown — same semantics as Ctrl+C, returns nil from `app.Run()`.
+
+Calling `Shutdown` **before** `Run` is honoured, not ignored: `Run` starts
+normally and then immediately begins a graceful shutdown with the recorded cause.
 
 ---
 
@@ -448,16 +509,31 @@ samsara.WithHealthLogger(slog.Default())
 | `WithHealthTimeout` | 5s | Deadline for each `Health()` call |
 | `WithStopTimeout` | 10s | Deadline for each `Stop()` call |
 | `WithRestartResetWindow` | 5m | Stable runtime before restart counter resets |
+| `WithShutdownGrace` | 0 (unbounded) | Total wall-clock budget for stopping all components; caps each `Stop` ctx. Auto-set to 90% of the Application's `WithShutdownTimeout` |
 | `WithSupervisorLogger` | nop | Structured logger |
 | `WithEventHooks` | nil | Lifecycle event callbacks |
 | `WithMetricsObserver` | nop | Telemetry receiver |
 | `WithParallelStartStop` | off | Start/stop components concurrently, constrained only by the dependency graph |
 
+### Component (registration)
+
+Passed to `sup.Add(component, opts...)`:
+
+| Option | Default | Description |
+|---|---|---|
+| `WithTier` | `TierCritical` | Failure-propagation tier |
+| `WithRestartPolicy` | `NeverRestart()` | Restart behaviour on failure |
+| `WithDependencies` | none | Names that must be ready before this starts |
+| `WithComponentHealthInterval` | supervisor default | Per-component poll interval override |
+| `WithComponentHealthTimeout` | supervisor default | Per-component `Health()` deadline override |
+| `WithHealthThreshold` | `1, 1` | Consecutive fails → unhealthy; consecutive oks → recovered |
+| `WithHealthJitter` | 0 | ±fraction applied to the poll interval |
+
 ### Application
 
 | Option | Default | Description |
 |---|---|---|
-| `WithShutdownTimeout` | 15s | How long to wait for clean exit after signal |
+| `WithShutdownTimeout` | 15s | How long to wait for clean exit after signal (bounds supervisor shutdown via `WithShutdownGrace`) |
 | `WithLogger` | nop | Structured logger |
 | `WithMainFunc` | nil | Optional blocking main function |
 | `WithSupervisor` | nil | Optional supervisor to run alongside main |

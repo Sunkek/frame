@@ -11,6 +11,41 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.6.0] — 2026-07-10
+
+### Added
+- **Post-`ready()` crash supervision.** A component whose `Start` returns
+  unexpectedly after signalling `ready()` — including components without a
+  `HealthChecker` — is now subject to its restart policy and tier handling
+  instead of being silently ignored. `manage` watches the running `Start`
+  goroutine for the component's whole lifetime.
+- **Supervision-aware `/livez`.** New `Supervisor.Alive()` and `LivenessReporter`
+  interface. `/livez` returns 503 once a Critical or Significant component fails
+  permanently and the supervisor enters a failure-driven shutdown — liveness now
+  reflects supervision, not just "the port is bound."
+- `WithShutdownGrace` supervisor option — bounds total graceful-shutdown
+  wall-clock by capping each component's `Stop` context to the smaller of
+  `WithStopTimeout` and the remaining budget. An Application propagates 90% of
+  its `WithShutdownTimeout` automatically, so N wedged components can no longer
+  serially blow the shutdown deadline.
+- Lifecycle hooks on `EventHooks`: `OnReady`, `BeforeStop`, `OnStopped` — for
+  draining in-flight work, flipping load-balancer probes, or lifecycle telemetry.
+- Per-component health tuning at registration: `WithComponentHealthInterval`,
+  `WithComponentHealthTimeout`, `WithHealthThreshold(fail, recover)` (debounces
+  transient blips so a single failed probe no longer flips `/readyz` or restarts),
+  and `WithHealthJitter` (de-synchronises probes).
+- New `samsara/testutil` package exporting a configurable `FakeComponent`
+  (implements `Component` + `HealthChecker`) with tunable ready/health/stop
+  behaviour, a `Crash` trigger, `WaitReady`, and call counters. Standard library
+  only. Added `example_test.go` with runnable examples.
+
+### Changed
+- `Application.Shutdown` called before `Run` is no longer a silent no-op. The
+  request and cause are recorded; `Run` starts normally and then immediately
+  begins a graceful shutdown.
+
+---
+
 ## [0.5.1] — 2026-07-09
 
 ### Fixed
