@@ -234,7 +234,7 @@ func (a *Application) Run() error {
 	select {
 	case <-done:
 	case <-time.After(a.shutdownTimeout):
-		a.logger.Error("shutdown timeout exceeded", "timeout", a.shutdownTimeout)
+		a.logger.Warn("shutdown timeout exceeded", "timeout", a.shutdownTimeout)
 		timeoutErr = ErrShutdownTimeout
 	}
 

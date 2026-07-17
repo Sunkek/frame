@@ -9,6 +9,16 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** `Logger` interface now requires a `Warn(msg string, kv ...any)`
+  method, unifying the interface with samsara-components
+  (`Debug`/`Info`/`Warn`/`Error`). Consumer logger adapters lacking `Warn`
+  must add it. Non-fatal conditions (shutdown timeout exceeded, transient
+  component unhealthiness, auxiliary component failure) are now logged at
+  `Warn` instead of `Error`.
+- Minimum supported Go version raised from 1.22 to 1.25.0 to match
+  samsara-components.
+
 ---
 
 ## [0.6.0] — 2026-07-10

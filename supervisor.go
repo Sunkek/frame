@@ -736,7 +736,7 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 	// done=false so the caller keeps monitoring.
 	onFault := func(fErr error) (termErr error, done bool) {
 		s.statuses[name].set(fErr)
-		s.logger.Error("component unhealthy", "component", name, "error", fErr)
+		s.logger.Warn("component unhealthy", "component", name, "error", fErr)
 		s.hooks.fireUnhealthy(name, fErr)
 
 		if time.Since(startedAt) > s.restartResetWindow {
@@ -868,7 +868,7 @@ func (s *Supervisor) handlePermanentFailure(mc *managedComponent, err error, can
 		cancel(fmt.Errorf("significant component %q failed: %w", name, err))
 		return fmt.Errorf("significant component %q failed: %w", name, err)
 	default:
-		s.logger.Error("auxiliary component failed permanently — continuing", "component", name, "error", err)
+		s.logger.Warn("auxiliary component failed permanently — continuing", "component", name, "error", err)
 		return nil
 	}
 }
@@ -912,7 +912,7 @@ func (s *Supervisor) doStop(mc *managedComponent) (err error) {
 		// Overall shutdown deadline exceeded: abandon this Stop with an
 		// already-cancelled context so a well-behaved Stop returns immediately
 		// and cannot block the remaining components past the deadline.
-		s.logger.Error("shutdown deadline exceeded — abandoning stop", "component", name)
+		s.logger.Warn("shutdown deadline exceeded — abandoning stop", "component", name)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		err = mc.component.Stop(ctx)
