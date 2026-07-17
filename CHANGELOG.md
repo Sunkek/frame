@@ -9,6 +9,12 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Race in `startOne`: a component whose `Start` signalled `ready()` and
+  returned almost immediately could be misclassified as a startup failure
+  (both channels ready, `select` picked the exit). Now re-checks the ready
+  signal and hands the exit to `manage` for post-ready crash semantics.
+
 ### Changed
 - **Breaking:** `Logger` interface now requires a `Warn(msg string, kv ...any)`
   method, unifying the interface with samsara-components

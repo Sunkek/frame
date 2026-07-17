@@ -602,9 +602,20 @@ func (s *Supervisor) startOne(ctx context.Context, mc *managedComponent) (<-chan
 			// Component signalled ready — it is now running.
 			timer.Stop()
 		case err := <-startExit:
-			// Start returned before calling ready() — treat as failure.
 			timer.Stop()
-			startErr = err
+			select {
+			case <-readySignal:
+				// Start signalled ready() and then returned almost immediately —
+				// both channels were ready and select picked startExit. This is a
+				// post-ready exit, not a startup failure: hand the exit back so
+				// the caller's manage loop applies post-ready crash semantics.
+				// startExit is buffered (cap 1) and was just drained, so the
+				// re-send cannot block.
+				startExit <- err
+			default:
+				// Start returned before calling ready() — treat as failure.
+				startErr = err
+			}
 		case <-ctx.Done():
 			timer.Stop()
 			// Drain startExit so the Start goroutine can exit cleanly.
