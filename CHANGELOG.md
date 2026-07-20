@@ -7,27 +7,13 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [0.6.0] — 2026-07-20
 
 ### Fixed
 - Race in `startOne`: a component whose `Start` signalled `ready()` and
   returned almost immediately could be misclassified as a startup failure
   (both channels ready, `select` picked the exit). Now re-checks the ready
   signal and hands the exit to `manage` for post-ready crash semantics.
-
-### Changed
-- **Breaking:** `Logger` interface now requires a `Warn(msg string, kv ...any)`
-  method, unifying the interface with samsara-components
-  (`Debug`/`Info`/`Warn`/`Error`). Consumer logger adapters lacking `Warn`
-  must add it. Non-fatal conditions (shutdown timeout exceeded, transient
-  component unhealthiness, auxiliary component failure) are now logged at
-  `Warn` instead of `Error`.
-- Minimum supported Go version raised from 1.22 to 1.25.0 to match
-  samsara-components.
-
----
-
-## [0.6.0] — 2026-07-10
 
 ### Added
 - **Post-`ready()` crash supervision.** A component whose `Start` returns
@@ -56,6 +42,14 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only. Added `example_test.go` with runnable examples.
 
 ### Changed
+- **Breaking:** `Logger` interface now requires a `Warn(msg string, kv ...any)`
+  method, unifying the interface with samsara-components
+  (`Debug`/`Info`/`Warn`/`Error`). Consumer logger adapters lacking `Warn`
+  must add it. Non-fatal conditions (shutdown timeout exceeded, transient
+  component unhealthiness, auxiliary component failure) are now logged at
+  `Warn` instead of `Error`.
+- Minimum supported Go version raised from 1.22 to 1.25.0 to match
+  samsara-components.
 - `Application.Shutdown` called before `Run` is no longer a silent no-op. The
   request and cause are recorded; `Run` starts normally and then immediately
   begins a graceful shutdown.
