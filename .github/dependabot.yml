@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # samsara itself has no third-party requires — this entry exists so that a
+  # dependency added later is covered from the first commit, and so the Go
+  # directive/toolchain bumps still get proposed.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-deps:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
