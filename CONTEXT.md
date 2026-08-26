@@ -62,9 +62,26 @@ _Avoid_: health check, ping, heartbeat
 
 **Fault**:
 A confirmed problem with a running Component: either enough consecutive failed
-probes to breach the threshold, or an unexpected exit after ready. Both kinds of
+probes to breach the fail threshold, or an unexpected exit after ready. Both kinds of
 fault are handled identically. A fault is what a restart policy responds to.
 _Avoid_: crash, error, outage
+
+**Fail threshold**:
+How many consecutive failed probes it takes to turn a run of blips into a fault.
+Set per Component with `WithHealthFailThreshold`; below 1 means the first failed
+probe is a fault.
+_Avoid_: max failures, retry count
+
+**Recover threshold**:
+How many consecutive successful probes it takes to leave the unhealthy state.
+Set per Component with `WithHealthRecoverThreshold`.
+_Avoid_: healthy count
+
+**Debounce**:
+The pairing of the two thresholds — the reason a single failed probe is not a
+fault and a single successful one is not a recovery. Its purpose is to keep
+transient blips out of restart decisions and readiness.
+_Avoid_: hysteresis, smoothing, flap protection
 
 **Unhealthy**:
 The state a Component is in between a fault and its recovery. Distinct from a

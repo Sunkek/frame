@@ -7,8 +7,12 @@ stdlib-only subpackage of test fakes.
 Read [CONTEXT.md](./CONTEXT.md) for the domain vocabulary — component, fault, tier,
 readiness — and use those words in code, comments, and commit messages. The decisions
 behind the surprising parts live in [docs/adr/](./docs/adr/): stdlib-only dependencies,
-the `nil`-on-clean-shutdown contract, the health server as a supervised component, and
-the fixed component set.
+the `nil`-on-clean-shutdown contract, the health server as a supervised component, the
+fixed component set, and the one-knob-per-option rule for `With…` options.
+
+[explanation.md](./explanation.md) is a long-form walkthrough of the package written to
+teach Go concurrency from this code. It is a learning guide, not the API reference —
+`README.md` and the doc comments are authoritative when the two disagree.
 
 ## Working here
 

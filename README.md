@@ -567,6 +567,16 @@ Passed to `sup.Add(component, opts...)`:
 
 ---
 
+## Further reading
+
+- [explanation.md](./explanation.md) — a long-form walkthrough of how the package
+  works internally, doubling as an introduction to Go concurrency. A learning guide;
+  this README and the doc comments are the reference.
+- [CONTEXT.md](./CONTEXT.md) — the domain glossary: component, fault, tier, readiness.
+- [docs/adr/](./docs/adr/) — the decisions behind the design.
+
+---
+
 ## Acknowledgements
 
 Initially inspired by [this article](https://habr.com/ru/companies/timeweb/articles/589167) and [appctl](https://github.com/iv-menshenin/appctl).

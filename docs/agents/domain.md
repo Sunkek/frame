@@ -24,7 +24,8 @@ decision actually gets resolved, not ahead of time.
 │   │   ├── 0001-zero-external-dependencies.md
 │   │   ├── 0002-clean-shutdown-returns-nil.md
 │   │   ├── 0003-health-server-is-a-supervised-component.md
-│   │   └── 0004-fixed-component-set.md
+│   │   ├── 0004-fixed-component-set.md
+│   │   └── 0005-one-knob-per-option.md
 │   └── agents/
 └── *.go
 ```
