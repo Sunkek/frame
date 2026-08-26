@@ -22,3 +22,11 @@ func (nopLogger) Warn(string, ...any)  {}
 func (nopLogger) Error(string, ...any) {}
 
 func newNopLogger() Logger { return nopLogger{} }
+
+// loggerDefaulter is implemented by types that accept an inherited logger:
+// one supplied by the owner (an Application to its Supervisor, a Supervisor to
+// its components) and used only when the type was not given a logger of its
+// own. An explicitly configured logger always wins.
+type loggerDefaulter interface {
+	setDefaultLogger(Logger)
+}

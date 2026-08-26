@@ -60,8 +60,16 @@ func WithHealthWriteTimeout(d time.Duration) HealthServerOption {
 	return func(c *healthServerConfig) { c.writeTimeout = d }
 }
 
+// WithHealthLogger sets the HealthServer's logger. Without it, the server
+// inherits the logger of the Supervisor it is registered with (which in turn
+// may have inherited the Application's). An explicit logger here always wins.
+// A nil logger is ignored.
 func WithHealthLogger(l Logger) HealthServerOption {
-	return func(c *healthServerConfig) { c.logger = l }
+	return func(c *healthServerConfig) {
+		if l != nil {
+			c.logger = l
+		}
+	}
 }
 
 // HealthServer is a Component that exposes three HTTP endpoints:
@@ -79,7 +87,10 @@ type HealthServer struct {
 	liveness LivenessReporter // non-nil if reporter also implements LivenessReporter
 	addr     string
 	server   *http.Server
-	logger   Logger
+
+	loggerMu  sync.RWMutex
+	logger    Logger
+	loggerSet bool // a logger was supplied via WithHealthLogger
 
 	mu    sync.RWMutex
 	alive bool
@@ -92,18 +103,22 @@ func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *Healt
 		addr:         defaultHealthAddr,
 		readTimeout:  defaultHealthReadTimeout,
 		writeTimeout: defaultHealthWriteTimeout,
-		logger:       newNopLogger(),
 	}
 	for _, o := range opts {
 		if o != nil {
 			o(&cfg)
 		}
 	}
+	logger := cfg.logger
+	if logger == nil {
+		logger = newNopLogger()
+	}
 	hs := &HealthServer{
-		name:     cfg.name,
-		reporter: reporter,
-		addr:     cfg.addr,
-		logger:   cfg.logger,
+		name:      cfg.name,
+		reporter:  reporter,
+		addr:      cfg.addr,
+		logger:    logger,
+		loggerSet: cfg.logger != nil,
 	}
 	if lr, ok := reporter.(LivenessReporter); ok {
 		hs.liveness = lr
@@ -121,12 +136,31 @@ func NewHealthServer(reporter HealthReporter, opts ...HealthServerOption) *Healt
 	return hs
 }
 
+// setDefaultLogger adopts the owning Supervisor's logger, but only if no
+// logger was configured via WithHealthLogger. Called by the Supervisor at the
+// start of Run.
+func (h *HealthServer) setDefaultLogger(l Logger) {
+	h.loggerMu.Lock()
+	defer h.loggerMu.Unlock()
+	if !h.loggerSet && l != nil {
+		h.logger = l
+		h.loggerSet = true
+	}
+}
+
+// log returns the logger currently in effect.
+func (h *HealthServer) log() Logger {
+	h.loggerMu.RLock()
+	defer h.loggerMu.RUnlock()
+	return h.logger
+}
+
 func (h *HealthServer) Name() string { return h.name }
 
 // Start implements Component. It binds the TCP port, calls ready() to signal
 // the supervisor, then serves until Stop is called.
 func (h *HealthServer) Start(_ context.Context, ready func()) error {
-	h.logger.Info("health server starting", "addr", h.addr)
+	h.log().Info("health server starting", "addr", h.addr)
 
 	ln, err := net.Listen("tcp", h.addr)
 	if err != nil {
@@ -137,7 +171,7 @@ func (h *HealthServer) Start(_ context.Context, ready func()) error {
 	h.alive = true
 	h.mu.Unlock()
 
-	h.logger.Info("health server listening", "addr", h.addr)
+	h.log().Info("health server listening", "addr", h.addr)
 	ready() // TCP port is bound — supervisor proceeds to next component
 
 	if err := h.server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -150,7 +184,7 @@ func (h *HealthServer) Stop(ctx context.Context) error {
 	h.mu.Lock()
 	h.alive = false
 	h.mu.Unlock()
-	h.logger.Info("health server stopping")
+	h.log().Info("health server stopping")
 	return h.server.Shutdown(ctx)
 }
 

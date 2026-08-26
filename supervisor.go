@@ -96,7 +96,11 @@ func WithRestartResetWindow(d time.Duration) SupervisorOption {
 }
 
 func WithSupervisorLogger(l Logger) SupervisorOption {
-	return func(c *supervisorConfig) { c.logger = l }
+	return func(c *supervisorConfig) {
+		if l != nil {
+			c.logger = l
+		}
+	}
 }
 
 func WithEventHooks(h *EventHooks) SupervisorOption {
@@ -137,6 +141,7 @@ type Supervisor struct {
 	restartResetWindow time.Duration
 	shutdownGrace      time.Duration
 	logger             Logger
+	loggerSet          bool // a logger was supplied via WithSupervisorLogger
 	hooks              *EventHooks
 	metrics            MetricsObserver
 
@@ -165,13 +170,16 @@ func NewSupervisor(opts ...SupervisorOption) *Supervisor {
 		healthTimeout:      defaultHealthTimeout,
 		stopTimeout:        defaultStopTimeout,
 		restartResetWindow: defaultRestartResetWindow,
-		logger:             newNopLogger(),
 		metrics:            newNopMetrics(),
 	}
 	for _, o := range opts {
 		if o != nil {
 			o(&cfg)
 		}
+	}
+	logger := cfg.logger
+	if logger == nil {
+		logger = newNopLogger()
 	}
 	return &Supervisor{
 		healthInterval:     cfg.healthInterval,
@@ -180,7 +188,8 @@ func NewSupervisor(opts ...SupervisorOption) *Supervisor {
 		stopTimeout:        cfg.stopTimeout,
 		restartResetWindow: cfg.restartResetWindow,
 		shutdownGrace:      cfg.shutdownGrace,
-		logger:             cfg.logger,
+		logger:             logger,
+		loggerSet:          cfg.logger != nil,
 		hooks:              cfg.hooks,
 		metrics:            cfg.metrics,
 		parallel:           cfg.parallel,
@@ -196,6 +205,28 @@ func NewSupervisor(opts ...SupervisorOption) *Supervisor {
 func (s *Supervisor) setDefaultShutdownGrace(d time.Duration) {
 	if s.shutdownGrace <= 0 && d > 0 {
 		s.shutdownGrace = d - d/shutdownGraceMarginDivisor
+	}
+}
+
+// setDefaultLogger adopts the owning Application's logger, but only if no
+// logger was configured via WithSupervisorLogger. Called by Application before
+// Run so that a single WithLogger call lights up the whole tree. Must be
+// called before Run.
+func (s *Supervisor) setDefaultLogger(l Logger) {
+	if !s.loggerSet && l != nil {
+		s.logger = l
+		s.loggerSet = true
+	}
+}
+
+// propagateLogger hands the supervisor's logger to every managed component
+// that can inherit one and was not configured with a logger of its own.
+// Called at the start of Run, once the logger is final.
+func (s *Supervisor) propagateLogger() {
+	for _, mc := range s.components {
+		if ld, ok := mc.component.(loggerDefaulter); ok {
+			ld.setDefaultLogger(s.logger)
+		}
 	}
 }
 
@@ -297,6 +328,7 @@ type ComponentStatus struct {
 // blocks until ctx is cancelled or a critical failure occurs.
 func (s *Supervisor) Run(ctx context.Context) error {
 	atomic.StoreInt32(&s.running, 1)
+	s.propagateLogger()
 
 	ordered, err := s.topoSort()
 	if err != nil {

@@ -9,6 +9,15 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Loggers are inherited down the ownership chain.** An Application hands its
+  `WithLogger` to the Supervisor it owns, and the Supervisor hands its logger to
+  the components it manages, the `HealthServer` included. Previously an
+  application that set only `WithLogger` got a silent Supervisor and a silent
+  health server with nothing to say so. An explicit `WithSupervisorLogger` or
+  `WithHealthLogger` still wins, a `nil` logger is ignored rather than
+  installed, and a component with no logger anywhere still logs nowhere.
+
 ### Fixed
 - `testutil.FakeComponent` now tracks crashes and readiness per life, so a test
   can crash it and watch the supervisor bring it back. Previously `Crash` ended
