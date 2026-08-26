@@ -42,10 +42,17 @@ func WithShutdownTimeout(d time.Duration) ApplicationOption {
 	return func(c *applicationConfig) { c.shutdownTimeout = d }
 }
 
-// WithLogger sets the logger used by the Application itself (not the
-// Supervisor — pass WithSupervisorLogger to NewSupervisor for that).
+// WithLogger sets the logger used by the Application. The Supervisor attached
+// with WithSupervisor inherits it, and in turn passes it on to the components
+// it manages, so a single WithLogger call gives the whole tree logging. A
+// logger set explicitly with WithSupervisorLogger or WithHealthLogger takes
+// precedence over the inherited one. A nil logger is ignored.
 func WithLogger(l Logger) ApplicationOption {
-	return func(c *applicationConfig) { c.logger = l }
+	return func(c *applicationConfig) {
+		if l != nil {
+			c.logger = l
+		}
+	}
 }
 
 // Application is the top-level entry point for a service. It wires together
@@ -71,6 +78,7 @@ type Application struct {
 	supervisor      *Supervisor
 	shutdownTimeout time.Duration
 	logger          Logger
+	loggerSet       bool // a logger was supplied via WithLogger
 
 	mu              sync.Mutex
 	cancelRoot      context.CancelCauseFunc
@@ -82,18 +90,22 @@ type Application struct {
 func NewApplication(opts ...ApplicationOption) *Application {
 	cfg := applicationConfig{
 		shutdownTimeout: defaultShutdownTimeout,
-		logger:          newNopLogger(),
 	}
 	for _, o := range opts {
 		if o != nil {
 			o(&cfg)
 		}
 	}
+	logger := cfg.logger
+	if logger == nil {
+		logger = newNopLogger()
+	}
 	return &Application{
 		main:            cfg.mainFunc,
 		supervisor:      cfg.supervisor,
 		shutdownTimeout: cfg.shutdownTimeout,
-		logger:          cfg.logger,
+		logger:          logger,
+		loggerSet:       cfg.logger != nil,
 	}
 }
 
@@ -184,6 +196,9 @@ func (a *Application) Run() error {
 		// Bound the supervisor's total shutdown work by the application's
 		// shutdown budget (A3) unless the caller set an explicit grace.
 		a.supervisor.setDefaultShutdownGrace(a.shutdownTimeout)
+		if a.loggerSet {
+			a.supervisor.setDefaultLogger(a.logger)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -496,6 +496,22 @@ samsara.WithSupervisorLogger(slog.Default())
 samsara.WithHealthLogger(slog.Default())
 ```
 
+### Which logger wins
+
+A logger is inherited down the ownership chain: the Application passes its logger
+to the Supervisor it was given with `WithSupervisor`, and the Supervisor passes
+its own on to the components it manages, the `HealthServer` among them. So a
+single `WithLogger` call is enough to get application, supervision, and health
+logs out of a standard wiring.
+
+Inheritance never overrides an explicit choice: a logger set with
+`WithSupervisorLogger` or `WithHealthLogger` keeps winning over the one handed
+down. A `nil` logger is ignored rather than installed, and a component that
+receives no logger from anywhere logs nowhere instead of panicking.
+
+Inheritance is resolved when the Supervisor starts, so a logger must be
+configured before `Application.Run` or `Supervisor.Run`.
+
 ---
 
 ## Configuration reference
@@ -510,7 +526,7 @@ samsara.WithHealthLogger(slog.Default())
 | `WithStopTimeout` | 10s | Deadline for each `Stop()` call |
 | `WithRestartResetWindow` | 5m | Stable runtime before restart counter resets |
 | `WithShutdownGrace` | 0 (unbounded) | Total wall-clock budget for stopping all components; caps each `Stop` ctx. Auto-set to 90% of the Application's `WithShutdownTimeout` |
-| `WithSupervisorLogger` | nop | Structured logger |
+| `WithSupervisorLogger` | inherited from the Application, else nop | Structured logger |
 | `WithEventHooks` | nil | Lifecycle event callbacks |
 | `WithMetricsObserver` | nop | Telemetry receiver |
 | `WithParallelStartStop` | off | Start/stop components concurrently, constrained only by the dependency graph |
@@ -534,7 +550,7 @@ Passed to `sup.Add(component, opts...)`:
 | Option | Default | Description |
 |---|---|---|
 | `WithShutdownTimeout` | 15s | How long to wait for clean exit after signal (bounds supervisor shutdown via `WithShutdownGrace`) |
-| `WithLogger` | nop | Structured logger |
+| `WithLogger` | nop | Structured logger; inherited by the Supervisor and its components |
 | `WithMainFunc` | nil | Optional blocking main function |
 | `WithSupervisor` | nil | Optional supervisor to run alongside main |
 
@@ -544,7 +560,7 @@ Passed to `sup.Add(component, opts...)`:
 |---|---|---|
 | `WithHealthAddr` | `:9090` | Listen address |
 | `WithHealthName` | `health-server` | Component name (for multi-instance setups) |
-| `WithHealthLogger` | nop | Structured logger |
+| `WithHealthLogger` | inherited from the Supervisor, else nop | Structured logger |
 | `WithHealthReadTimeout` | 5s | HTTP read timeout |
 | `WithHealthWriteTimeout` | 5s | HTTP write timeout |
 
