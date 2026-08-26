@@ -16,7 +16,10 @@ type EventHooks struct {
 
 	// OnRecovered is called when a component leaves the unhealthy state, after
 	// enough consecutive successful Health probes to breach the recover
-	// threshold.
+	// threshold. Either kind of fault enters that state, so a component that
+	// crashed after ready(), restarted and is probing healthy again recovers
+	// through this hook too. A component without a Health method has no probes
+	// and so never recovers.
 	OnRecovered func(component string)
 
 	// OnFailed is called when a component fails permanently — either because
