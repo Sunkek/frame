@@ -15,9 +15,9 @@ const (
 )
 
 // HealthReporter is the interface the HealthServer uses to query component
-// health. *Supervisor satisfies this via HealthReportOrdered().
+// health. *Supervisor satisfies this via HealthReport().
 type HealthReporter interface {
-	HealthReportOrdered() []NamedComponentStatus
+	HealthReport() []NamedComponentStatus
 }
 
 // LivenessReporter is an optional extension of HealthReporter. When the
@@ -224,7 +224,7 @@ func (h *HealthServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 		h.handleLivez(w, nil)
 		return
 	}
-	report := h.reporter.HealthReportOrdered()
+	report := h.reporter.HealthReport()
 	allHealthy := true
 	details := make([]componentHealthDetail, 0, len(report))
 	for _, status := range report {

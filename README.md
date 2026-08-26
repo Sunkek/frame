@@ -403,7 +403,7 @@ func (s *Server) Start(ctx context.Context, ready func()) error {
 Inspect all component states at any time via the supervisor:
 
 ```go
-for _, status := range sup.HealthReportOrdered() {
+for _, status := range sup.HealthReport() {
     fmt.Printf("%-20s healthy=%-5v restarts=%d\n",
         status.Name,
         status.Err == nil,
