@@ -605,12 +605,18 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- sup.Run(ctx) }()
 
+	// Keep-alives off: a pooled connection left in http.StateNew makes
+	// server.Shutdown wait ~5 s for it, which would time out the shutdown
+	// assertion below for reasons unrelated to the supervisor.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	defer client.CloseIdleConnections()
+
 	// Poll until the server is accepting connections (up to 3 s).
 	var resp *http.Response
 	var err error
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err = http.Get("http://localhost:19090/livez")
+		resp, err = client.Get("http://localhost:19090/livez")
 		if err == nil {
 			break
 		}
@@ -628,7 +634,7 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	// /readyz should eventually return 200 once db is started.
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, err = http.Get("http://localhost:19090/readyz")
+		resp, err = client.Get("http://localhost:19090/readyz")
 		if err == nil && resp.StatusCode == http.StatusOK {
 			resp.Body.Close()
 			break
@@ -640,7 +646,7 @@ func TestHealthServer_Endpoints(t *testing.T) {
 	}
 
 	// /healthz is an alias for /readyz.
-	resp2, err2 := http.Get("http://localhost:19090/healthz")
+	resp2, err2 := client.Get("http://localhost:19090/healthz")
 	if err2 != nil {
 		cancel()
 		t.Fatalf("healthz request failed: %v", err2)
