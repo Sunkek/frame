@@ -262,36 +262,9 @@ func (s *Supervisor) Add(c Component, opts ...ComponentOption) {
 	s.insertionOrder = append(s.insertionOrder, name)
 }
 
-// ComponentHealth returns the last known health error for a named component.
-func (s *Supervisor) ComponentHealth(name string) (err error, known bool) {
-	s.statusMu.RLock()
-	hs, ok := s.statuses[name]
-	s.statusMu.RUnlock()
-	if !ok {
-		return nil, false
-	}
-	known, _, err = hs.get()
-	return
-}
-
-// HealthReport returns a snapshot of all component health states keyed by name.
-func (s *Supervisor) HealthReport() map[string]ComponentStatus {
-	s.statusMu.RLock()
-	statuses := s.statuses
-	s.statusMu.RUnlock()
-	if statuses == nil {
-		return nil
-	}
-	out := make(map[string]ComponentStatus, len(statuses))
-	for name, hs := range statuses {
-		known, restarts, err := hs.get()
-		out[name] = ComponentStatus{Err: err, Known: known, Tier: hs.tier, RestartCount: restarts}
-	}
-	return out
-}
-
-// HealthReportOrdered returns a name-sorted slice of component health states.
-func (s *Supervisor) HealthReportOrdered() []NamedComponentStatus {
+// HealthReport returns a name-sorted snapshot of every component's health
+// state. The slice is freshly allocated on each call and safe to retain.
+func (s *Supervisor) HealthReport() []NamedComponentStatus {
 	s.statusMu.RLock()
 	statuses := s.statuses
 	s.statusMu.RUnlock()

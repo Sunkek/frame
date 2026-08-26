@@ -16,6 +16,17 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `WithHealthThreshold(3, 2)` becomes `WithHealthFailThreshold(3)` plus
   `WithHealthRecoverThreshold(2)`; either may be omitted to leave that threshold
   at its default. Values below 1 still mean "act on the first probe".
+- **Breaking:** The Supervisor exposes one health-report reader.
+  `HealthReportOrdered()` is now `HealthReport()`, keeping the same name-sorted
+  `[]NamedComponentStatus` return; the old map-returning `HealthReport()` and
+  `ComponentHealth(name)` are gone.
+  - `sup.HealthReportOrdered()` becomes `sup.HealthReport()`.
+  - `sup.HealthReport()[name]` becomes a scan over `sup.HealthReport()` for the
+    entry whose `Name` matches.
+  - `err, known := sup.ComponentHealth(name)` becomes the same scan, reading
+    `st.Err` and `st.Known` off the matching entry.
+  - `HealthReporter` now declares `HealthReport() []NamedComponentStatus`, so
+    custom reporters passed to `NewHealthServer` need the method renamed.
 - **Loggers are inherited down the ownership chain.** An Application hands its
   `WithLogger` to the Supervisor it owns, and the Supervisor hands its logger to
   the components it manages, the `HealthServer` included. Previously an

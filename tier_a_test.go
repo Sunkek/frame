@@ -96,7 +96,7 @@ func TestPostReadyCrash_NonHealthComponent_Restarts(t *testing.T) {
 
 func reportFor(t *testing.T, sup *samsara.Supervisor, name string) (bool, int, error) {
 	t.Helper()
-	for _, s := range sup.HealthReportOrdered() {
+	for _, s := range sup.HealthReport() {
 		if s.Name == name {
 			return s.Known, s.RestartCount, s.Err
 		}
@@ -137,7 +137,7 @@ type fakeLivenessReporter struct {
 	alive atomic.Bool
 }
 
-func (f *fakeLivenessReporter) HealthReportOrdered() []samsara.NamedComponentStatus {
+func (f *fakeLivenessReporter) HealthReport() []samsara.NamedComponentStatus {
 	return nil
 }
 func (f *fakeLivenessReporter) Alive() bool { return f.alive.Load() }
