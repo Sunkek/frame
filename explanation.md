@@ -1029,15 +1029,15 @@ These are the subtle decisions a careful reader should be able to defend. They a
 
 ### 18.1 The map is shared without a lock — on purpose
 
-In `manage` (`supervisor.go:601`/`625`) the code reads `s.statuses[name]` directly, *not* under `statusMu`:
+In `manage` (`supervisor.go`) the code reads `s.statuses[name]` directly, *not* under `statusMu`:
 
 ```go
 s.statuses[name].set(nil)
 ```
 
-But `HealthReport` (`supervisor.go:204`) takes `statusMu.RLock()`. Why the asymmetry? Because there are **two different shared things**, with two different synchronization stories:
+But `Supervisor.HealthReport` (`supervisor.go`) takes `statusMu.RLock()`. Why the asymmetry? Because there are **two different shared things**, with two different synchronization stories:
 
-1. The **map structure** (`s.statuses` itself — the `map` header, its buckets). Written exactly once in `Run` (`supervisor.go:264-269`) *before any goroutine that reads it is launched*. The goroutine launch (`go func()` in `launch`/`runParallel`) is itself a happens-before edge: everything the parent did before `go` is visible to the child (this is a guarantee of the Go memory model, not an accident of the scheduler). So `manage` reading the map needs no lock — the write already "happened before" the read.
+1. The **map structure** (`s.statuses` itself — the `map` header, its buckets). Written exactly once in `Run` (the `s.statuses = make(map[string]*healthStatus, len(ordered))` block, `supervisor.go`) *before any goroutine that reads it is launched*. The goroutine launch (`go func()` in `launch`/`runParallel`) is itself a happens-before edge: everything the parent did before `go` is visible to the child (this is a guarantee of the Go memory model, not an accident of the scheduler). So `manage` reading the map needs no lock — the write already "happened before" the read.
 2. The **`*healthStatus` values** the map points to. These *are* mutated concurrently (each tick calls `.set()`). They carry their own `mu` (`healthStatus.mu`, an `RWMutex`). That is what protects the actual field writes.
 
 A Go map detail that makes this safe: **concurrent reads of a map are fine; a
@@ -1047,25 +1047,25 @@ the `-race` detector). The package never *writes* the map after startup — it
 only mutates the pointed-to values — so the map itself is read-only-concurrent
 and the runtime check is never tripped.
 
-`HealthReport` still takes `statusMu` because it reads the *map variable* `s.statuses` from a goroutine (the HTTP handler) that has *no* happens-before edge to `Run`'s initialisation — it was not launched by `Run` after the map write. The `RLock` pairs with `Run`'s `Lock` (`supervisor.go:264`) to supply that missing edge. This is the single most advanced idea in the package: **synchronization scope follows the data, not the syntax.** Read the comment at `supervisor.go:591-595` (the `manage` doc) and `supervisor.go:12-14` (the `healthStatus` doc) — they state exactly this invariant. If someone later adds a code path that mutates the map after startup, this whole argument breaks and both the race detector and the runtime map-race check will (rightly) scream.
+`HealthReport` still takes `statusMu` because it reads the *map variable* `s.statuses` from a goroutine (the HTTP handler) that has *no* happens-before edge to `Run`'s initialisation — it was not launched by `Run` after the map write. The `RLock` pairs with the `s.statusMu.Lock()` that guards `Run`'s map build to supply that missing edge. This is the single most advanced idea in the package: **synchronization scope follows the data, not the syntax.** Read the doc comment on `manage` ("It accesses s.statuses[name] directly (without statusMu) because the map …") and the one on the `healthStatus` type ("tier is set once at Run() time before any goroutine can read it …"), both in `supervisor.go` — they state exactly this invariant. If someone later adds a code path that mutates the map after startup, this whole argument breaks and both the race detector and the runtime map-race check will (rightly) scream.
 
 ### 18.2 Two buffered channels, two different reasons
 
-- `readyCh := make(chan error, 1)` (`supervisor.go:483`) — buffered size 1 so the launch goroutine can send its ready/fail result and move on even if `runSequential`'s `select` already left via `ctx.Done()`. Without the buffer the goroutine would block forever on send → leak.
-- `startExit := make(chan error, 1)` (`supervisor.go:538`) — buffered so the goroutine running `Start` can deliver `Start`'s return value even after `startOne` stopped listening (e.g. it returned on timeout). Same leak-avoidance reasoning, one level deeper.
+- `readyCh := make(chan error, 1)` (in `launch`, `supervisor.go`) — buffered size 1 so the launch goroutine can send its ready/fail result and move on even if `runSequential`'s `select` already left via `ctx.Done()`. Without the buffer the goroutine would block forever on send → leak.
+- `startExit := make(chan error, 1)` (in `startOne`, `supervisor.go`) — buffered so the goroutine running `Start` can deliver `Start`'s return value even after `startOne` stopped listening (e.g. it returned on timeout). Same leak-avoidance reasoning, one level deeper.
 
 Rule you can carry to your own code: **if a goroutine sends on a channel and the receiver might already be gone, buffer it (or the goroutine leaks).** Buffer size = max number of unreceived sends.
 
 ### 18.3 `criticalErrCh` capacity = number of components
 
-`criticalErrCh := make(chan error, len(ordered))` (`supervisor.go:285` sequential, `352` parallel). Every component's `manage` may send exactly one critical error. Buffer sized so *all* of them can report without blocking, even if `Run` hasn't started draining yet. Then `Run` `close()`s it and `range`s to collect (`supervisor.go:329-335` / `419-425`). Closing-then-ranging is the canonical "collect from N producers" pattern — `range` over a channel yields every buffered value and then exits cleanly when the channel is closed and drained. But it is only safe because `wg.Wait()`/`lifeWg.Wait()` (`supervisor.go:328` / `418`) guarantees every producer goroutine has exited *before* the close. Sending on a closed channel panics (`send on closed channel`); the `WaitGroup` is the barrier that makes the close provably safe — no producer can still be in flight.
+`criticalErrCh := make(chan error, len(ordered))` (first statement of both `runSequential` and `runParallel`, `supervisor.go`). Every component's `manage` may send exactly one critical error. Buffer sized so *all* of them can report without blocking, even if `Run` hasn't started draining yet. Then each runner `close()`s it and `range`s to collect (the `close(criticalErrCh)` / `for err := range criticalErrCh` pairs in `runSequential` and `runParallel`). Closing-then-ranging is the canonical "collect from N producers" pattern — `range` over a channel yields every buffered value and then exits cleanly when the channel is closed and drained. But it is only safe because the `wg.Wait()`/`lifeWg.Wait()` immediately preceding each close guarantees every producer goroutine has exited *before* the close. Sending on a closed channel panics (`send on closed channel`); the `WaitGroup` is the barrier that makes the close provably safe — no producer can still be in flight.
 
 ### 18.4 Why `cancel(err)` AND `criticalErrCh <- err`
 
-In `launch` (`supervisor.go:498-501`):
+In `launch` (`supervisor.go`):
 
 ```go
-if err := s.manage(ctx, mc, cancel); err != nil {
+if err := s.manage(ctx, mc, cancel, startExit); err != nil {
     criticalErrCh <- err
     cancel(err)
 }
@@ -1075,16 +1075,16 @@ Two distinct jobs: `criticalErrCh <- err` makes the error *retrievable* by `Run`
 
 ### 18.5 The clean-shutdown-vs-failure filter, in three places
 
-`isContextError` (`application.go:101`) appears at every boundary where "the context was cancelled" must be distinguished from "something crashed":
+`isContextError` (`application.go`) appears at every boundary where "the context was cancelled" must be distinguished from "something crashed":
 
-- `Supervisor.Run` (`supervisor.go:319`, `340`, `426`): only return `context.Cause` if the cause is a *real* failure, not the OS signal that cancelled the parent. The guard is `if cause := context.Cause(ctx); cause != nil && !isContextError(ctx.Err())`.
-- `Application.Run`'s supervisor goroutine (`application.go:174`): swallow the supervisor's error entirely if the root context was signal-cancelled.
+- `Supervisor.Run`'s runners (three guards: two in `runSequential`, one in `runParallel`, `supervisor.go`): only return `context.Cause` if the cause is a *real* failure, not the OS signal that cancelled the parent. The guard is `if cause := context.Cause(ctx); cause != nil && !isContextError(ctx.Err())`.
+- `Application.Run`'s supervisor goroutine (the `if isContextError(rootCtx.Err())` guard, `application.go`): swallow the supervisor's error entirely if the root context was signal-cancelled.
 
 This is the practical answer to a question that trips up everyone: *"my context-cancelled error keeps surfacing as a fatal error on Ctrl+C."* The fix is exactly this — treat `context.Canceled`/`DeadlineExceeded` as success at the lifecycle boundary. Note the CLAUDE.md invariant "`Start` must return `nil` on clean shutdown" is the component-side half of the same rule.
 
 ### 18.6 The restart-reset window has order-dependent subtlety
 
-In `manage` (`supervisor.go:641-643`):
+In `manage`'s `onFault` (`supervisor.go`):
 
 ```go
 if time.Since(startedAt) > s.restartResetWindow {
@@ -1092,15 +1092,15 @@ if time.Since(startedAt) > s.restartResetWindow {
 }
 ```
 
-`startedAt` is reset to `time.Now()` after every successful restart (`supervisor.go:673`). So the attempt counter only resets if the component ran *cleanly for longer than the window* since its last (re)start. A component that flaps every minute under a 5-minute window will keep climbing `attempt` until the policy gives up — which is what you want (flapping ≠ healthy). Trace this with `ExponentialBackoff` to see why the window exists: without it, a component that recovers briefly then dies would restart forever.
+`startedAt` is reset to `time.Now()` after every successful restart (the `startedAt = time.Now()` a few lines further down in the same closure). So the attempt counter only resets if the component ran *cleanly for longer than the window* since its last (re)start. A component that flaps every minute under a 5-minute window will keep climbing `attempt` until the policy gives up — which is what you want (flapping ≠ healthy). Trace this with `ExponentialBackoff` to see why the window exists: without it, a component that recovers briefly then dies would restart forever.
 
 ### 18.7 `signal.NotifyContext` must be released mid-shutdown
 
-`stopSig()` is called twice (`application.go:149` deferred, and `application.go:203` explicitly; the deferred call is harmless since `stopSig` is idempotent). The explicit early call is the important one: while `NotifyContext` is active it *intercepts* SIGINT, so a second Ctrl+C during a slow shutdown does nothing. Releasing it restores default behavior → second Ctrl+C hard-kills. This is a real operational nicety; users expect "Ctrl+C again to force quit."
+`stopSig()` is called twice in `Application.Run` (`defer stopSig()` right after `signal.NotifyContext`, and an explicit call just before the "application shutting down" log; the deferred call is harmless since `stopSig` is idempotent). The explicit early call is the important one: while `NotifyContext` is active it *intercepts* SIGINT, so a second Ctrl+C during a slow shutdown does nothing. Releasing it restores default behavior → second Ctrl+C hard-kills. This is a real operational nicety; users expect "Ctrl+C again to force quit."
 
 ### 18.8 Things to try to prove you own it
 
 1. Make a component never call `ready()`. Predict: `startOne` times out at `startTimeout`, treated as failure → restart policy decides. Run a test to confirm.
-2. Give a `TierAuxiliary` component `NeverRestart()` and make `Health` fail. Predict: logged + hook fired, `/readyz` *stays* 200 (aux excluded at `health_server.go:182`, `handlePermanentFailure` returns `nil` for aux at `supervisor.go:690-692`), app keeps running.
+2. Give a `TierAuxiliary` component `NeverRestart()` and make `Health` fail. Predict: logged + hook fired, `/readyz` *stays* 200 (aux excluded by the `if status.Tier != TierAuxiliary` guard in `handleReadyz`, `health_server.go`; `handlePermanentFailure`'s `default` branch returns `nil` for aux, `supervisor.go`), app keeps running.
 3. Add a `fmt.Println` in `manage` before `s.statuses[name].set` and run `go test -race`. Confirm no race is reported — then convince yourself why, using §18.1.
 4. Remove the buffer from `readyCh` (size 0) and run the shutdown-during-startup test. Watch it hang/leak. Restore it.
