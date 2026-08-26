@@ -8,12 +8,15 @@ package samsara
 // the component, so they must not block. Enqueue to a channel or spawn a
 // goroutine if you need non-trivial work (e.g. sending a PagerDuty alert).
 type EventHooks struct {
-	// OnUnhealthy is called when a component's Health check returns a non-nil
-	// error. It receives the component name and the health error.
+	// OnUnhealthy is called on a confirmed fault: either enough consecutive
+	// failed Health probes to breach the configured threshold, or an
+	// unexpected Start exit after ready(). It receives the component name and
+	// the error that caused the fault.
 	OnUnhealthy func(component string, err error)
 
-	// OnRecovered is called when a component's Health check returns nil again
-	// after a previous OnUnhealthy event.
+	// OnRecovered is called when a component leaves the unhealthy state, after
+	// enough consecutive successful Health probes to breach the recover
+	// threshold.
 	OnRecovered func(component string)
 
 	// OnFailed is called when a component fails permanently — either because
