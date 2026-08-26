@@ -1,43 +1,67 @@
-# Repository Guidelines
+# AGENTS.md
 
-## Project Structure & Module Organization
-This repository is a Go module (`github.com/sunkek/samsara`) whose core is a single package with source files at the repository root (for example, `application.go`, `supervisor.go`, `health_server.go`), plus a stdlib-only `testutil/` subpackage of test fakes.  
-Tests live in `samsara_test.go` and topic files (`tier_a_test.go`, `tier_b_test.go`, `tier_c_test.go`, `parallel_test.go`, `example_test.go`); add new tests as `*_test.go` files.  
-Project metadata and contributor docs are also at root: `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `SECURITY.md`. CI config is in `.github/workflows/ci.yml`.
+`samsara` is a Go library (single package, `github.com/sunkek/samsara`) that supervises
+service component lifecycles. Sources and tests sit at the repo root; `testutil/` is a
+stdlib-only subpackage of test fakes.
 
-## Build, Test, and Development Commands
-Use the `Makefile` targets:
+Read [CONTEXT.md](./CONTEXT.md) for the domain vocabulary — component, fault, tier,
+readiness — and use those words in code, comments, and commit messages. The decisions
+behind the surprising parts live in [docs/adr/](./docs/adr/): stdlib-only dependencies,
+the `nil`-on-clean-shutdown contract, the health server as a supervised component, and
+the fixed component set.
 
-- `make test`: run fast unit tests (`go test ./...`).
-- `make test-race`: run race-enabled tests 3 times (CI-equivalent).
-- `make vet`: run `go vet ./...`.
-- `make lint`: run `staticcheck ./...` (install separately).
-- `make fmt`: format code with `gofmt -w -s .`.
-- `make check`: full local gate (`fmt`, `vet`, `test-race`).
-- `make tidy`: run `go mod tidy`.
+## Working here
 
-For direct parity with CI, prefer `make check` before opening a PR.
+Run `make check` (fmt, vet, race tests) before opening a PR; `make lint` needs
+`go install honnef.co/go/tools/cmd/staticcheck@latest` first. One test:
+`go test -run TestName ./...`.
 
-## Coding Style & Naming Conventions
-Follow standard Go formatting and idioms; `gofmt` is mandatory.  
-Keep the package dependency-free unless a change is explicitly discussed first.  
-Use clear, descriptive exported names (`NewSupervisor`, `WithHealthInterval`) and keep commit-sized changes focused.  
-Commit subjects should be short, imperative, and under 72 characters (example: `fix shutdown race in supervisor`).
+The package manages concurrent goroutine lifecycles, so races are the likeliest bug
+class and `go test -race -count=3` is the gate that catches them. Every behavioural
+change needs a test that fails before it and passes after. Reach for
+`samsara/testutil.FakeComponent` rather than a fresh stub.
 
-## Testing Guidelines
-Concurrency safety is core to this project. Every change should include tests for behavior and shutdown/restart edge cases where relevant.  
-Race detection is required: run `go test -race -count=3 -timeout=120s ./...` (or `make test-race`).  
-Use Go test naming conventions (`TestXxx`) and prefer table-driven tests for policy/state-matrix scenarios.
+Keep the module stdlib-only. Concrete Prometheus and OpenTelemetry adapters belong in
+the separate `samsara-components` module.
 
-## Commit & Pull Request Guidelines
-For non-trivial changes, open an issue first to confirm direction.  
-PRs should include:
+## Invariants
 
-- clear problem statement and rationale,
-- tests that fail before and pass after,
-- docs updates when public behavior/API changes.
+These hold across the package; a change that breaks one needs the reasoning written
+down before the code.
 
-Keep PR scope tight; avoid unrelated refactors. Reference issue IDs when relevant (for example, `(#42)`).
+- The `statuses` map is built once in `Run`, before any goroutine starts, and is never
+  structurally mutated. `manage` therefore reads `s.statuses[name]` without `statusMu`.
+  Anything that changes the component set at runtime must move every status access
+  behind the mutex first.
+- A confirmed fault (`onFault`, `supervisor.go`) covers both a threshold-breaching
+  health probe and an unexpected post-`ready()` `Start` exit; both take the same
+  restart-policy and tier path. Only the confirmed state drives readiness and restarts —
+  raw probes still reach the `MetricsObserver`.
+- The restart attempt counter resets after `WithRestartResetWindow` (default 5 min) of
+  fault-free running.
+- A `Component`'s `Stop` is idempotent and safe to call concurrently with a still-
+  initialising `Start`; its `ready()` fires only once the component can genuinely serve.
 
-## Security & Reporting
-Do not disclose vulnerabilities in public issues. Use GitHub Security Advisories (`Security -> Report a vulnerability`) as described in `SECURITY.md`.
+## Commits and PRs
+
+Open an issue first for non-trivial direction changes. Commit subjects: imperative,
+under 72 characters. PRs carry a problem statement, the tests, and doc updates when
+public behaviour changes. Report vulnerabilities through GitHub Security Advisories,
+per `SECURITY.md`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues for `sunkek/samsara`, driven through the `gh` CLI.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its role name.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root.
+See `docs/agents/domain.md`.
