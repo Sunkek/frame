@@ -141,7 +141,7 @@ type Supervisor struct {
 	metrics            MetricsObserver
 
 	running      int32
-	failing      int32        // set to 1 when a Critical/Significant component fails permanently
+	failing      atomic.Bool  // true when a Critical/Significant component fails permanently
 	stopDeadline atomic.Int64 // unix-nanos hard deadline for all Stop work; 0 = unbounded
 	statusMu     sync.RWMutex
 	statuses     map[string]*healthStatus
@@ -154,7 +154,7 @@ type Supervisor struct {
 // HealthServer consults this to make /livez reflect supervision state rather
 // than merely "the health port is open" (see LivenessReporter).
 func (s *Supervisor) Alive() bool {
-	return atomic.LoadInt32(&s.failing) == 0
+	return !s.failing.Load()
 }
 
 // NewSupervisor constructs a Supervisor with the given options.
@@ -195,7 +195,7 @@ func NewSupervisor(opts ...SupervisorOption) *Supervisor {
 // race. Must be called before Run.
 func (s *Supervisor) setDefaultShutdownGrace(d time.Duration) {
 	if s.shutdownGrace <= 0 && d > 0 {
-		s.shutdownGrace = d - d/10 // 90% of the app budget
+		s.shutdownGrace = d - d/shutdownGraceMarginDivisor
 	}
 }
 
@@ -876,12 +876,12 @@ func (s *Supervisor) handlePermanentFailure(mc *managedComponent, err error, can
 	name := mc.component.Name()
 	switch mc.tier {
 	case TierCritical:
-		atomic.StoreInt32(&s.failing, 1)
+		s.failing.Store(true)
 		s.logger.Error("critical component failed — shutting down", "component", name, "error", err)
 		cancel(fmt.Errorf("critical component %q failed: %w", name, err))
 		return fmt.Errorf("critical component %q failed: %w", name, err)
 	case TierSignificant:
-		atomic.StoreInt32(&s.failing, 1)
+		s.failing.Store(true)
 		s.logger.Error("significant component failed permanently — shutting down", "component", name, "error", err)
 		cancel(fmt.Errorf("significant component %q failed: %w", name, err))
 		return fmt.Errorf("significant component %q failed: %w", name, err)
@@ -925,26 +925,25 @@ func (s *Supervisor) doStop(mc *managedComponent) (err error) {
 	s.hooks.fireBeforeStop(name)
 	defer func() { s.hooks.fireStopped(name, err) }()
 
+	var ctx context.Context
+	var cancel context.CancelFunc
 	budget, ok := s.stopBudget()
-	if !ok {
+	if ok {
+		ctx, cancel = context.WithTimeout(context.Background(), budget)
+	} else {
 		// Overall shutdown deadline exceeded: abandon this Stop with an
 		// already-cancelled context so a well-behaved Stop returns immediately
 		// and cannot block the remaining components past the deadline.
 		s.logger.Warn("shutdown deadline exceeded — abandoning stop", "component", name)
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel = context.WithCancel(context.Background())
 		cancel()
-		err = mc.component.Stop(ctx)
-		if err != nil {
-			s.logger.Error("component stop error", "component", name, "error", err)
-		}
-		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
+
 	err = mc.component.Stop(ctx)
 	if err != nil {
 		s.logger.Error("component stop error", "component", name, "error", err)
-	} else {
+	} else if ok {
 		s.logger.Info("component stopped", "component", name)
 	}
 	return err
