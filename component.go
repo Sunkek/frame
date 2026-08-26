@@ -115,11 +115,37 @@ type componentConfig struct {
 	restartPolicy RestartPolicy
 	deps          []string
 
-	healthInterval   time.Duration // 0 = use supervisor default
-	healthTimeout    time.Duration // 0 = use supervisor default
+	health healthTuning
+}
+
+// healthTuning holds the five per-component health knobs. Every field is
+// optional: a zero value means "use the supervisor default", so the same type
+// carries both the caller's declared overrides and, after resolve, the values
+// the health loop actually runs with.
+type healthTuning struct {
+	interval         time.Duration // 0 = use supervisor default
+	timeout          time.Duration // 0 = use supervisor default
 	failThreshold    int           // consecutive failures before unhealthy; 0/1 = act immediately
 	recoverThreshold int           // consecutive successes before recovered; 0/1 = act immediately
-	healthJitter     float64       // ±fraction applied to the interval; 0 = none
+	jitter           float64       // ±fraction applied to the interval; 0 = none
+}
+
+// resolve returns the tuning with every unset knob filled in from the
+// supervisor's defaults.
+func (h healthTuning) resolve(s *Supervisor) healthTuning {
+	if h.interval <= 0 {
+		h.interval = s.healthInterval
+	}
+	if h.timeout <= 0 {
+		h.timeout = s.healthTimeout
+	}
+	if h.failThreshold < 1 {
+		h.failThreshold = 1
+	}
+	if h.recoverThreshold < 1 {
+		h.recoverThreshold = 1
+	}
+	return h
 }
 
 // WithTier sets the importance tier of a component. Defaults to TierCritical.
@@ -142,13 +168,13 @@ func WithDependencies(names ...string) ComponentOption {
 // WithComponentHealthInterval overrides the supervisor's global health-poll
 // interval for this component. Zero (the default) uses the supervisor value.
 func WithComponentHealthInterval(d time.Duration) ComponentOption {
-	return func(c *componentConfig) { c.healthInterval = d }
+	return func(c *componentConfig) { c.health.interval = d }
 }
 
 // WithComponentHealthTimeout overrides the supervisor's global per-probe Health
 // timeout for this component. Zero (the default) uses the supervisor value.
 func WithComponentHealthTimeout(d time.Duration) ComponentOption {
-	return func(c *componentConfig) { c.healthTimeout = d }
+	return func(c *componentConfig) { c.health.timeout = d }
 }
 
 // WithHealthThreshold sets how many consecutive failed Health probes mark the
@@ -158,8 +184,8 @@ func WithComponentHealthTimeout(d time.Duration) ComponentOption {
 // as 1 (act on the first probe, the historical behaviour).
 func WithHealthThreshold(fail, recover int) ComponentOption {
 	return func(c *componentConfig) {
-		c.failThreshold = fail
-		c.recoverThreshold = recover
+		c.health.failThreshold = fail
+		c.health.recoverThreshold = recover
 	}
 }
 
@@ -168,7 +194,7 @@ func WithHealthThreshold(fail, recover int) ComponentOption {
 // is clamped to [0, 1]; 0 (the default) disables jitter. E.g. 0.1 spreads a 10s
 // interval over [9s, 11s].
 func WithHealthJitter(fraction float64) ComponentOption {
-	return func(c *componentConfig) { c.healthJitter = fraction }
+	return func(c *componentConfig) { c.health.jitter = fraction }
 }
 
 // managedComponent pairs a Component with its supervisor metadata.
@@ -178,9 +204,5 @@ type managedComponent struct {
 	restartPolicy RestartPolicy
 	deps          []string
 
-	healthInterval   time.Duration
-	healthTimeout    time.Duration
-	failThreshold    int
-	recoverThreshold int
-	healthJitter     float64
+	health healthTuning
 }
