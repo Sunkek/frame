@@ -26,15 +26,21 @@ type FakeComponent struct {
 	stopErr    error         // returned by Stop
 
 	healthErr atomic.Value // stores string; "" means healthy
-	crashErr  atomic.Value // stores error box; set by Crash to make a running Start return
 
 	starts  atomic.Int32
 	stops   atomic.Int32
 	healths atomic.Int32
 
-	mu      sync.Mutex
-	ready   chan struct{} // closed once ready() first fires
-	crashCh chan struct{} // closed by Crash to unblock a running Start
+	// Per-life state. A life begins when Start is called and ends when Start
+	// returns, whether through Crash or context cancellation. Both channels are
+	// replaced at the start of the next life so a fresh Start neither inherits
+	// the previous life's crash nor its readiness.
+	mu         sync.Mutex
+	readyCh    chan struct{} // closed when the current life signals ready()
+	readyFired bool          // whether readyCh is closed
+	crashCh    chan struct{} // closed by Crash to unblock the running Start
+	crashed    bool          // whether crashCh is closed
+	crashErr   error         // error the crashed life's Start returns
 }
 
 // Option configures a FakeComponent at construction time.
@@ -75,7 +81,7 @@ func WithInitialHealthError(err error) Option {
 func NewFakeComponent(name string, opts ...Option) *FakeComponent {
 	f := &FakeComponent{
 		name:    name,
-		ready:   make(chan struct{}),
+		readyCh: make(chan struct{}),
 		crashCh: make(chan struct{}),
 	}
 	f.healthErr.Store("")
@@ -92,7 +98,8 @@ func (f *FakeComponent) Name() string { return f.name }
 
 // Start implements samsara.Component. It honours the configured start/ready
 // behaviour, then blocks until Stop is called, ctx is cancelled, or Crash is
-// invoked (in which case it returns the crash error).
+// invoked (in which case it returns the crash error). Each call begins a fresh
+// life: a crash or cancellation from a previous life does not carry over.
 func (f *FakeComponent) Start(ctx context.Context, ready func()) error {
 	f.starts.Add(1)
 
@@ -100,35 +107,78 @@ func (f *FakeComponent) Start(ctx context.Context, ready func()) error {
 		return f.startErr
 	}
 
+	crashCh := f.beginLife()
+
 	if f.readyDelay > 0 {
 		select {
 		case <-time.After(f.readyDelay):
 		case <-ctx.Done():
+			f.endLife()
 			return nil
 		}
 	}
 
 	if !f.blockReady {
 		ready()
-		f.mu.Lock()
-		select {
-		case <-f.ready:
-		default:
-			close(f.ready)
-		}
-		f.mu.Unlock()
+		f.signalReady()
 	}
 
 	select {
 	case <-ctx.Done():
+		f.endLife()
 		return nil
-	case <-f.crashCh:
-		if v := f.crashErr.Load(); v != nil {
-			if boxed, ok := v.(errBox); ok {
-				return boxed.err
-			}
+	case <-crashCh:
+		f.mu.Lock()
+		err := f.crashErr
+		f.mu.Unlock()
+		if err == nil {
+			err = errors.New("testutil: fake component crashed")
 		}
-		return errors.New("testutil: fake component crashed")
+		return err
+	}
+}
+
+// beginLife starts a fresh life, replacing any channel the previous life
+// already closed, and returns the crash channel this life must select on.
+func (f *FakeComponent) beginLife() chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readyFired {
+		f.readyCh = make(chan struct{})
+		f.readyFired = false
+	}
+	if f.crashed {
+		f.crashCh = make(chan struct{})
+		f.crashed = false
+		f.crashErr = nil
+	}
+	return f.crashCh
+}
+
+// endLife marks the current life as no longer ready, so a WaitReady that
+// straddles a restart waits for the next life rather than the finished one.
+func (f *FakeComponent) endLife() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clearReadyLocked()
+}
+
+// signalReady closes the current life's ready channel.
+func (f *FakeComponent) signalReady() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.readyFired {
+		f.readyFired = true
+		close(f.readyCh)
+	}
+}
+
+// clearReadyLocked resets readiness for the life that just ended. f.mu must be
+// held.
+func (f *FakeComponent) clearReadyLocked() {
+	if f.readyFired {
+		f.readyCh = make(chan struct{})
+		f.readyFired = false
 	}
 }
 
@@ -160,31 +210,36 @@ func (f *FakeComponent) SetHealthError(err error) {
 	f.healthErr.Store(err.Error())
 }
 
-// errBox lets a typed error be stored in an atomic.Value with a stable concrete
-// type across calls.
-type errBox struct{ err error }
-
-// Crash makes a currently-running Start return err (simulating a post-ready
-// crash). It is a no-op if the component is not running. Safe to call once.
+// Crash makes the currently-running Start return err, simulating a post-ready
+// crash. It applies to the current life only: the component is left not ready,
+// and a subsequent Start begins a fresh life that blocks as a healthy component
+// would rather than returning err again. It is a no-op if the current life has
+// already crashed.
 func (f *FakeComponent) Crash(err error) {
 	if err == nil {
 		err = errors.New("testutil: fake component crashed")
 	}
-	f.crashErr.Store(errBox{err: err})
 	f.mu.Lock()
-	select {
-	case <-f.crashCh:
-	default:
-		close(f.crashCh)
+	defer f.mu.Unlock()
+	f.clearReadyLocked()
+	if f.crashed {
+		return
 	}
-	f.mu.Unlock()
+	f.crashErr = err
+	f.crashed = true
+	close(f.crashCh)
 }
 
-// WaitReady blocks until Start has signalled ready() or timeout elapses,
-// reporting whether ready fired in time.
+// WaitReady blocks until the current life signals ready() or timeout elapses,
+// reporting whether ready fired in time. It reflects the current life only: a
+// crashed or cancelled life is not ready, so after a crash WaitReady waits for
+// the restarted component to signal ready again.
 func (f *FakeComponent) WaitReady(timeout time.Duration) bool {
+	f.mu.Lock()
+	ch := f.readyCh
+	f.mu.Unlock()
 	select {
-	case <-f.ready:
+	case <-ch:
 		return true
 	case <-time.After(timeout):
 		return false
