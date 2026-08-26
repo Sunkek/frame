@@ -687,7 +687,7 @@ so it never holds the lock across I/O.
 overall status, where the **tier decides whether a degraded component counts**:
 
 ```go
-report := h.reporter.HealthReportOrdered()
+report := h.reporter.HealthReport()
 allHealthy := true
 for _, status := range report {
     detail := componentHealthDetail{Name: status.Name, Status: statusOK, ...}

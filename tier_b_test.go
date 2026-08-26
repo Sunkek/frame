@@ -115,8 +115,10 @@ func TestHealthThreshold_DebouncesTransientBlip(t *testing.T) {
 		t.Fatalf("transient blip below threshold should not restart; got %d restarts", n)
 	}
 	// readiness must have stayed healthy throughout (status never set to error).
-	if err, known := sup.ComponentHealth("flaky"); known && err != nil {
-		t.Fatalf("status should stay healthy below threshold; got %v", err)
+	for _, st := range sup.HealthReport() {
+		if st.Name == "flaky" && st.Known && st.Err != nil {
+			t.Fatalf("status should stay healthy below threshold; got %v", st.Err)
+		}
 	}
 }
 

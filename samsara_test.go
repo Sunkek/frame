@@ -957,8 +957,8 @@ func TestHealthReporter_Interface(t *testing.T) {
 
 	waitStarted(t, mc, 2*time.Second)
 
-	// HealthReportOrdered should return at least the svc component.
-	report := sup.HealthReportOrdered()
+	// HealthReport should return at least the svc component.
+	report := sup.HealthReport()
 	found := false
 	for _, s := range report {
 		if s.Name == "svc" {
@@ -967,7 +967,7 @@ func TestHealthReporter_Interface(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("HealthReportOrdered: expected 'svc' entry")
+		t.Error("HealthReport: expected 'svc' entry")
 	}
 
 	cancel()
@@ -1080,9 +1080,9 @@ func TestApplication_ShutdownWithCause(t *testing.T) {
 	}
 }
 
-// ── HealthReportOrdered determinism (#5) ─────────────────────────────────────
+// ── HealthReport determinism (#5) ─────────────────────────────────────
 
-func TestHealthReportOrdered_Deterministic(t *testing.T) {
+func TestHealthReport_Deterministic(t *testing.T) {
 	sup := samsara.NewSupervisor()
 	z := newMock("zebra")
 	a := newMock("alpha")
@@ -1102,7 +1102,7 @@ func TestHealthReportOrdered_Deterministic(t *testing.T) {
 	waitStarted(t, m, 2*time.Second)
 
 	for range 20 {
-		report := sup.HealthReportOrdered()
+		report := sup.HealthReport()
 		if len(report) != 3 {
 			continue
 		}
@@ -1111,7 +1111,7 @@ func TestHealthReportOrdered_Deterministic(t *testing.T) {
 			names[i] = r.Name
 		}
 		if names[0] != "alpha" || names[1] != "mango" || names[2] != "zebra" {
-			t.Errorf("HealthReportOrdered not sorted: %v", names)
+			t.Errorf("HealthReport not sorted: %v", names)
 			break
 		}
 	}
@@ -1155,7 +1155,7 @@ func TestSupervisor_SignificantUnhealthy_DegradedNotShutdown(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	var foundDegraded bool
 	for time.Now().Before(deadline) {
-		for _, s := range sup.HealthReportOrdered() {
+		for _, s := range sup.HealthReport() {
 			if s.Name == "cache" && s.Err != nil {
 				foundDegraded = true
 			}
@@ -1402,7 +1402,7 @@ func TestComponentStatus_RestartCountIncrements(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	var restartCount int
 	for time.Now().Before(deadline) {
-		for _, s := range sup.HealthReportOrdered() {
+		for _, s := range sup.HealthReport() {
 			if s.Name == "db" {
 				restartCount = s.RestartCount
 			}
