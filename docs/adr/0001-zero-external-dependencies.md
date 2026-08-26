@@ -6,9 +6,9 @@ the very bottom of a service's import graph, so any dependency it takes is
 forced on every consumer and every consumer's version resolution.
 
 The cost is that integration points must be expressed as interfaces the caller
-implements — `Logger`, `MetricsObserver`, `HealthChecker` — instead of concrete
-`slog`, Prometheus, or OpenTelemetry types. Concrete adapters live in the
-separate `samsara-components` module, which is free to take dependencies.
+implements — `Logger`, `MetricsObserver` — instead of concrete `slog`,
+Prometheus, or OpenTelemetry types. Concrete adapters live in the separate
+`samsara-components` module, which is free to take dependencies.
 
 Reversing this would not just add a `go.mod` line; it would change the shape of
 the public API, since the interfaces exist precisely to avoid the dependency.

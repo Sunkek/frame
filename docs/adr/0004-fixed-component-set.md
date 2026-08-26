@@ -1,7 +1,8 @@
 # The set of Components is fixed before the Supervisor runs
 
 Components can only be added before `Run`; there is no dynamic add or remove at
-runtime, and `Add` after start is an error.
+runtime, and `Add` after start panics. The panic is what makes the property
+enforceable rather than advisory: there is no error return to ignore.
 
 This buys a specific concurrency property: the status map is built once, before
 any goroutine exists, and is never structurally mutated afterwards. Per-component
