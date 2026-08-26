@@ -255,3 +255,76 @@ func TestShutdownGrace_BoundsTotalStopTime(t *testing.T) {
 		t.Fatalf("shutdown took %v, expected bounded by grace ~%v", elapsed, grace)
 	}
 }
+
+// postReadyCrashHealth is a postReadyCrash that also implements HealthChecker,
+// always probing healthy. It exists to prove that a post-ready crash enters the
+// unhealthy state, so the restarted component recovers out of it.
+type postReadyCrashHealth struct {
+	postReadyCrash
+}
+
+func (c *postReadyCrashHealth) Health(context.Context) error { return nil }
+
+// A post-ready crash is a confirmed fault like any other, so the component
+// announces OnUnhealthy, restarts, and — once its probes are sustainedly
+// healthy again — announces OnRecovered.
+func TestPostReadyCrash_RecoversAfterRestart(t *testing.T) {
+	c := &postReadyCrashHealth{postReadyCrash{name: "worker", readyCh: make(chan int), crashUntil: 1}}
+
+	var mu sync.Mutex
+	var events []string
+	recovered := make(chan struct{}, 1)
+	hooks := &samsara.EventHooks{
+		OnUnhealthy: func(string, error) {
+			mu.Lock()
+			events = append(events, "unhealthy")
+			mu.Unlock()
+		},
+		OnRecovered: func(string) {
+			mu.Lock()
+			events = append(events, "recovered")
+			mu.Unlock()
+			select {
+			case recovered <- struct{}{}:
+			default:
+			}
+		},
+	}
+
+	sup := samsara.NewSupervisor(
+		samsara.WithEventHooks(hooks),
+		samsara.WithHealthInterval(5*time.Millisecond),
+	)
+	sup.Add(c,
+		samsara.WithTier(samsara.TierAuxiliary),
+		samsara.WithRestartPolicy(samsara.AlwaysRestart(1*time.Millisecond)),
+		samsara.WithHealthThreshold(1, 2),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	recvReady(t, c.readyCh, 1)
+	recvReady(t, c.readyCh, 2)
+
+	select {
+	case <-recovered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("component never recovered after a post-ready crash")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("supervisor did not stop in time")
+	}
+
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	if len(got) < 2 || got[0] != "unhealthy" || got[1] != "recovered" {
+		t.Fatalf("expected unhealthy then recovered, got %v", got)
+	}
+}

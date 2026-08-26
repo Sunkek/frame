@@ -809,6 +809,13 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 			}
 			s.logger.Error("component start goroutine exited unexpectedly",
 				"component", name, "error", fErr)
+			// A post-ready exit is a confirmed fault, so it enters the unhealthy
+			// state exactly as a threshold-breaching probe does. A component with
+			// Health then leaves it through the usual sustained-recovery path;
+			// one without probes simply has no way back, as before.
+			unhealthy = true
+			failCount = 0
+			okCount = 0
 			if termErr, done := onFault(fErr); done {
 				return termErr
 			}
