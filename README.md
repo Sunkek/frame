@@ -226,12 +226,12 @@ Health behaviour can be overridden per component at registration:
 sup.Add(cache,
     samsara.WithComponentHealthInterval(2*time.Second), // override global interval
     samsara.WithComponentHealthTimeout(500*time.Millisecond),
-    samsara.WithHealthThreshold(3, 1), // unhealthy after 3 consecutive fails; recovered after 1 ok
+    samsara.WithHealthFailThreshold(3), // unhealthy after 3 consecutive fails
     samsara.WithHealthJitter(0.1),     // ±10% jitter to de-synchronise probes
 )
 ```
 
-`WithHealthThreshold` debounces transient blips: below the fail threshold a
+`WithHealthFailThreshold` debounces transient blips: below the fail threshold a
 failed probe does **not** flip `/readyz` or trigger a restart. Defaults
 (threshold `1`, no jitter, global interval/timeout) preserve the original
 behaviour.
@@ -542,7 +542,8 @@ Passed to `sup.Add(component, opts...)`:
 | `WithDependencies` | none | Names that must be ready before this starts |
 | `WithComponentHealthInterval` | supervisor default | Per-component poll interval override |
 | `WithComponentHealthTimeout` | supervisor default | Per-component `Health()` deadline override |
-| `WithHealthThreshold` | `1, 1` | Consecutive fails → unhealthy; consecutive oks → recovered |
+| `WithHealthFailThreshold` | `1` | Consecutive failed probes before unhealthy |
+| `WithHealthRecoverThreshold` | `1` | Consecutive ok probes before recovered |
 | `WithHealthJitter` | 0 | ±fraction applied to the poll interval |
 
 ### Application

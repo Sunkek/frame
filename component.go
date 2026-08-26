@@ -177,16 +177,19 @@ func WithComponentHealthTimeout(d time.Duration) ComponentOption {
 	return func(c *componentConfig) { c.health.timeout = d }
 }
 
-// WithHealthThreshold sets how many consecutive failed Health probes mark the
-// component unhealthy (fail), and how many consecutive successes mark it
-// recovered again (recover). This debounces transient blips: a single failed
-// probe no longer flips /readyz or triggers a restart. Values < 1 are treated
-// as 1 (act on the first probe, the historical behaviour).
-func WithHealthThreshold(fail, recover int) ComponentOption {
-	return func(c *componentConfig) {
-		c.health.failThreshold = fail
-		c.health.recoverThreshold = recover
-	}
+// WithHealthFailThreshold sets how many consecutive failed Health probes mark
+// the component unhealthy. This debounces transient blips: below the threshold a
+// failed probe no longer flips /readyz or triggers a restart. Values < 1 are
+// treated as 1 (act on the first probe, the default).
+func WithHealthFailThreshold(n int) ComponentOption {
+	return func(c *componentConfig) { c.health.failThreshold = n }
+}
+
+// WithHealthRecoverThreshold sets how many consecutive successful Health probes
+// mark an unhealthy component recovered again. Values < 1 are treated as 1 (act
+// on the first probe, the default).
+func WithHealthRecoverThreshold(n int) ComponentOption {
+	return func(c *componentConfig) { c.health.recoverThreshold = n }
 }
 
 // WithHealthJitter applies a random ±fraction to this component's health-poll
