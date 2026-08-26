@@ -222,15 +222,11 @@ func (s *Supervisor) Add(c Component, opts ...ComponentOption) {
 		panic(fmt.Errorf("%w: %s", ErrComponentAlreadyRegistered, name))
 	}
 	s.components[name] = &managedComponent{
-		component:        c,
-		tier:             cfg.tier,
-		restartPolicy:    cfg.restartPolicy,
-		deps:             cfg.deps,
-		healthInterval:   cfg.healthInterval,
-		healthTimeout:    cfg.healthTimeout,
-		failThreshold:    cfg.failThreshold,
-		recoverThreshold: cfg.recoverThreshold,
-		healthJitter:     cfg.healthJitter,
+		component:     c,
+		tier:          cfg.tier,
+		restartPolicy: cfg.restartPolicy,
+		deps:          cfg.deps,
+		health:        cfg.health,
 	}
 	s.insertionOrder = append(s.insertionOrder, name)
 }
@@ -706,30 +702,15 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 	// Component is running and considered healthy until proven otherwise.
 	s.statuses[name].set(nil)
 
-	// Resolve per-component health tuning, falling back to supervisor defaults.
-	interval := mc.healthInterval
-	if interval <= 0 {
-		interval = s.healthInterval
-	}
-	hTimeout := mc.healthTimeout
-	if hTimeout <= 0 {
-		hTimeout = s.healthTimeout
-	}
-	failThreshold := mc.failThreshold
-	if failThreshold < 1 {
-		failThreshold = 1
-	}
-	recoverThreshold := mc.recoverThreshold
-	if recoverThreshold < 1 {
-		recoverThreshold = 1
-	}
+	// Per-component health tuning, with supervisor defaults filled in.
+	health := mc.health.resolve(s)
 
 	var (
 		timer  *time.Timer
 		timerC <-chan time.Time
 	)
 	if hasHealth {
-		timer = time.NewTimer(jittered(interval, mc.healthJitter))
+		timer = time.NewTimer(jittered(health.interval, health.jitter))
 		defer timer.Stop()
 		timerC = timer.C
 	}
@@ -823,10 +804,10 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 		case <-timerC:
 			// Schedule the next probe up front so the cadence holds regardless of
 			// which branch below is taken (transient, recovery, or restart).
-			timer.Reset(jittered(interval, mc.healthJitter))
+			timer.Reset(jittered(health.interval, health.jitter))
 
 			t0 := time.Now()
-			hCtx, hCancel := context.WithTimeout(ctx, hTimeout)
+			hCtx, hCancel := context.WithTimeout(ctx, health.timeout)
 			hErr := hc.Health(hCtx)
 			hCancel()
 			duration := time.Since(t0)
@@ -839,7 +820,7 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 				failCount = 0
 				if unhealthy {
 					okCount++
-					if okCount >= recoverThreshold {
+					if okCount >= health.recoverThreshold {
 						unhealthy = false
 						okCount = 0
 						s.statuses[name].set(nil)
@@ -852,10 +833,10 @@ func (s *Supervisor) manage(ctx context.Context, mc *managedComponent, cancel co
 
 			okCount = 0
 			failCount++
-			if failCount < failThreshold {
+			if failCount < health.failThreshold {
 				// Transient blip: below threshold, do not flip readiness or restart.
 				s.logger.Debug("component health probe failed (below threshold)",
-					"component", name, "error", hErr, "fails", failCount, "threshold", failThreshold)
+					"component", name, "error", hErr, "fails", failCount, "threshold", health.failThreshold)
 				continue
 			}
 
