@@ -298,7 +298,7 @@ func TestPostReadyCrash_RecoversAfterRestart(t *testing.T) {
 	sup.Add(c,
 		samsara.WithTier(samsara.TierAuxiliary),
 		samsara.WithRestartPolicy(samsara.AlwaysRestart(1*time.Millisecond)),
-		samsara.WithHealthThreshold(1, 2),
+		samsara.WithHealthRecoverThreshold(2),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

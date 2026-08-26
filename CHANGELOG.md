@@ -10,6 +10,12 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Changed
+- **Breaking:** `WithHealthThreshold(fail, recover int)` is split into
+  `WithHealthFailThreshold(n)` and `WithHealthRecoverThreshold(n)`, so a call
+  site names which threshold it is setting instead of relying on argument order.
+  `WithHealthThreshold(3, 2)` becomes `WithHealthFailThreshold(3)` plus
+  `WithHealthRecoverThreshold(2)`; either may be omitted to leave that threshold
+  at its default. Values below 1 still mean "act on the first probe".
 - **Loggers are inherited down the ownership chain.** An Application hands its
   `WithLogger` to the Supervisor it owns, and the Supervisor hands its logger to
   the components it manages, the `HealthServer` included. Previously an

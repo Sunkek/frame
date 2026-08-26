@@ -94,7 +94,7 @@ func TestHealthThreshold_DebouncesTransientBlip(t *testing.T) {
 	mc := newMock("flaky")
 	sup.Add(mc,
 		samsara.WithRestartPolicy(samsara.AlwaysRestart(1*time.Millisecond)),
-		samsara.WithHealthThreshold(3, 1),
+		samsara.WithHealthFailThreshold(3),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -135,7 +135,7 @@ func TestHealthThreshold_FiresAfterConsecutiveFailures(t *testing.T) {
 	mc := newMock("sick")
 	sup.Add(mc,
 		samsara.WithRestartPolicy(samsara.AlwaysRestart(1*time.Millisecond)),
-		samsara.WithHealthThreshold(2, 1),
+		samsara.WithHealthFailThreshold(2),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

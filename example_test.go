@@ -30,7 +30,7 @@ func ExampleApplication() {
 		samsara.WithTier(samsara.TierSignificant),
 		samsara.WithDependencies("db"),
 		samsara.WithRestartPolicy(samsara.ExponentialBackoff(5, 100*time.Millisecond)),
-		samsara.WithHealthThreshold(3, 1), // debounce transient blips
+		samsara.WithHealthFailThreshold(3), // debounce transient blips
 	)
 
 	app := samsara.NewApplication(
@@ -82,15 +82,16 @@ func ExampleEventHooks() {
 	// stopped: api
 }
 
-// ExampleWithHealthThreshold shows configuring a component so a single failed
+// ExampleWithHealthFailThreshold shows configuring a component so a single failed
 // probe does not immediately flip readiness or trigger a restart.
-func ExampleWithHealthThreshold() {
+func ExampleWithHealthFailThreshold() {
 	f := testutil.NewFakeComponent("flaky", testutil.WithInitialHealthError(errors.New("warming up")))
 	sup := samsara.NewSupervisor()
 	sup.Add(f,
 		samsara.WithTier(samsara.TierAuxiliary),
-		samsara.WithHealthThreshold(3, 2), // unhealthy after 3 fails, recovered after 2 oks
-		samsara.WithHealthJitter(0.1),     // de-synchronise probes
+		samsara.WithHealthFailThreshold(3),    // unhealthy after 3 consecutive fails
+		samsara.WithHealthRecoverThreshold(2), // recovered after 2 consecutive oks
+		samsara.WithHealthJitter(0.1),         // de-synchronise probes
 	)
 	fmt.Println("configured")
 	// Output: configured
