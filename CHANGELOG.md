@@ -10,6 +10,10 @@ samsara uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
+- `testutil.FakeComponent` now tracks crashes and readiness per life, so a test
+  can crash it and watch the supervisor bring it back. Previously `Crash` ended
+  every subsequent life immediately, burning a restart budget in microseconds,
+  and `WaitReady` reported the first life's readiness forever.
 - A post-`ready()` crash now enters the unhealthy state, as a threshold-breaching
   health probe already did. A component that crashed, restarted and probes
   healthy again fires `OnRecovered`; previously the recovery transition had no
