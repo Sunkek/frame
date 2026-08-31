@@ -1,6 +1,6 @@
 # samsara
 
-[![CI](https://github.com/Sunkek/samsara/actions/workflows/ci.yml/badge.svg)](https://github.com/Sunkek/samsara/actions/workflows/ci.yml)
+[![CI](https://github.com/sunkek/samsara/actions/workflows/ci.yml/badge.svg)](https://github.com/sunkek/samsara/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/sunkek/samsara.svg)](https://pkg.go.dev/github.com/sunkek/samsara)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sunkek/samsara)](https://goreportcard.com/report/github.com/sunkek/samsara)
 
